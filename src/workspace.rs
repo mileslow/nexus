@@ -19,7 +19,9 @@ use crate::file_view::FileView;
 use crate::home::display_path;
 use crate::layout::{Direction, Node};
 use crate::links::{self, LinkTarget};
-use crate::pane::{icon_button, status_color, terminal_glyph, Pane, PaneEvent, PaneItem};
+use crate::pane::{
+    icon_button, status_color, terminal_glyph, Pane, PaneEvent, PaneItem, TabPlacement,
+};
 use crate::session_list::{SessionList, SessionListEvent};
 use crate::sessions::{self, Agent, Session};
 use crate::terminal::{SpawnOptions, TerminalView};
@@ -733,6 +735,11 @@ impl Workspace {
             PaneEvent::ContextMenu { position, item } => {
                 self.open_terminal_menu(*position, pane.clone(), *item, cx)
             }
+            PaneEvent::TabDropped {
+                item,
+                from,
+                placement,
+            } => self.move_tab(*item, *from, pane, *placement, window, cx),
             PaneEvent::NewTerminal => self.spawn_terminal(pane, None, window, cx),
         }
     }
@@ -745,6 +752,69 @@ impl Workspace {
         if let Some(path) = path {
             self.file_tree.update(cx, |tree, cx| tree.reveal(&path, cx));
         }
+    }
+
+    /// Moves a tab out of the pane it was dragged from and into `target`,
+    /// either among its tabs or in a new pane split off one of its sides.
+    fn move_tab(
+        &mut self,
+        item: EntityId,
+        from: EntityId,
+        target: &Entity<Pane>,
+        placement: TabPlacement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self
+            .panes()
+            .into_iter()
+            .find(|pane| pane.entity_id() == from)
+        else {
+            return;
+        };
+        let same_pane = source == *target;
+        match placement {
+            TabPlacement::Split(direction) => {
+                // Splitting a pane's only tab off itself would change nothing.
+                if same_pane && source.read(cx).items().len() < 2 {
+                    return;
+                }
+                let Some(moved) = source.update(cx, |pane, cx| pane.take_item(item, window, cx))
+                else {
+                    return;
+                };
+                let new_pane = self.create_pane(window, cx);
+                let destination = if self.center.split(
+                    target,
+                    new_pane.clone(),
+                    direction,
+                    &mut self.next_split_id,
+                ) {
+                    new_pane
+                } else {
+                    target.clone()
+                };
+                destination.update(cx, |pane, cx| pane.add_item(moved, window, cx));
+                self.set_active_pane(&destination, cx);
+            }
+            TabPlacement::Before(_) | TabPlacement::End => {
+                if same_pane {
+                    return;
+                }
+                let Some(moved) = source.update(cx, |pane, cx| pane.take_item(item, window, cx))
+                else {
+                    return;
+                };
+                let index = match placement {
+                    TabPlacement::Before(index) => index,
+                    _ => usize::MAX,
+                };
+                target.update(cx, |pane, cx| pane.insert_item(index, moved, window, cx));
+                self.set_active_pane(target, cx);
+            }
+        }
+        self.sync_open_sessions(cx);
+        cx.notify();
     }
 
     /// Opens a new terminal pane beside `pane`, on the given side.

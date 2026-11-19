@@ -121,21 +121,92 @@ fn syntaxes() -> &'static SyntaxSet {
     SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
+/// Builds a syntect theme from a color theme's own token colors.
+fn custom_syntax_theme(colors: &theme::SyntaxColors, text: u32) -> Theme {
+    use std::str::FromStr;
+    use syntect::highlighting::{Color, ScopeSelectors, StyleModifier, ThemeItem, ThemeSettings};
+    let color = |hex: u32| Color {
+        r: (hex >> 16) as u8,
+        g: (hex >> 8) as u8,
+        b: hex as u8,
+        a: 0xff,
+    };
+    // Later rules win over earlier ones of the same specificity.
+    let rules = [
+        ("comment, punctuation.definition.comment", colors.comment),
+        ("string", colors.string),
+        ("constant.numeric", colors.number),
+        (
+            "constant.language, constant.character.escape, constant.other",
+            colors.constant,
+        ),
+        ("keyword, storage", colors.keyword),
+        ("keyword.operator", colors.operator),
+        (
+            "entity.name.function, support.function, variable.function",
+            colors.function,
+        ),
+        (
+            "entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, \
+             entity.name.trait, support.type, support.class, entity.other.inherited-class",
+            colors.type_name,
+        ),
+        ("entity.name.tag", colors.tag),
+        ("entity.other.attribute-name", colors.attribute),
+    ];
+    Theme {
+        name: None,
+        author: None,
+        settings: ThemeSettings {
+            // Unmatched text reports this color, which marks it as plain.
+            foreground: Some(color(text)),
+            ..ThemeSettings::default()
+        },
+        scopes: rules
+            .into_iter()
+            .filter_map(|(selector, hex)| {
+                Some(ThemeItem {
+                    scope: ScopeSelectors::from_str(selector).ok()?,
+                    style: StyleModifier {
+                        foreground: Some(color(hex)),
+                        background: None,
+                        font_style: None,
+                    },
+                })
+            })
+            .collect(),
+    }
+}
+
 /// The syntect theme that goes with the active color theme.
 fn syntax_theme() -> &'static Theme {
     use two_face::theme::EmbeddedThemeName as Name;
-    static THEMES: OnceLock<two_face::theme::EmbeddedLazyThemeSet> = OnceLock::new();
-    THEMES
-        .get_or_init(two_face::theme::extra)
-        .get(match theme::active().syntax {
-            theme::Syntax::OneHalfDark => Name::OneHalfDark,
-            theme::Syntax::TwoDark => Name::TwoDark,
-            theme::Syntax::CatppuccinMocha => Name::CatppuccinMocha,
-            theme::Syntax::GruvboxDark => Name::GruvboxDark,
-            theme::Syntax::Nord => Name::Nord,
-            theme::Syntax::Github => Name::Github,
-            theme::Syntax::CatppuccinLatte => Name::CatppuccinLatte,
-        })
+    static BUNDLED: OnceLock<two_face::theme::EmbeddedLazyThemeSet> = OnceLock::new();
+    static CUSTOM: OnceLock<std::sync::Mutex<std::collections::HashMap<usize, &'static Theme>>> =
+        OnceLock::new();
+    let bundled = |name: Name| BUNDLED.get_or_init(two_face::theme::extra).get(name);
+    match theme::active().syntax {
+        theme::Syntax::OneHalfDark => bundled(Name::OneHalfDark),
+        theme::Syntax::TwoDark => bundled(Name::TwoDark),
+        theme::Syntax::CatppuccinMocha => bundled(Name::CatppuccinMocha),
+        theme::Syntax::GruvboxDark => bundled(Name::GruvboxDark),
+        theme::Syntax::Nord => bundled(Name::Nord),
+        theme::Syntax::Github => bundled(Name::Github),
+        theme::Syntax::CatppuccinLatte => bundled(Name::CatppuccinLatte),
+        theme::Syntax::Dracula => bundled(Name::Dracula),
+        theme::Syntax::SolarizedDark => bundled(Name::SolarizedDark),
+        theme::Syntax::SolarizedLight => bundled(Name::SolarizedLight),
+        theme::Syntax::Custom(colors) => {
+            // Built once per theme and kept for the life of the app.
+            let mut built = CUSTOM
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            built.entry(theme::active_index()).or_insert_with(|| {
+                Box::leak(Box::new(custom_syntax_theme(colors, theme::term_fg())))
+            })
+        }
+    }
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
@@ -1018,6 +1089,49 @@ mod tests {
         // Rows: same "short", removed long line, added "new".
         assert_eq!(changes.longest_row, 1);
         assert_eq!(changes.diff.rows.len(), 3);
+    }
+
+    #[test]
+    fn custom_syntax_colors_reach_the_right_tokens() {
+        use syntect::highlighting::Color;
+        let colors = theme::SyntaxColors {
+            comment: 0x010101,
+            string: 0x020202,
+            number: 0x030303,
+            constant: 0x040404,
+            keyword: 0x050505,
+            function: 0x060606,
+            type_name: 0x070707,
+            tag: 0x080808,
+            attribute: 0x090909,
+            operator: 0x0a0a0a,
+        };
+        let custom = custom_syntax_theme(&colors, 0xeeeeee);
+        assert_eq!(custom.scopes.len(), 10, "every selector parsed");
+
+        let set = syntaxes();
+        let syntax = set.find_syntax_by_extension("rs").unwrap();
+        let mut highlighter = HighlightLines::new(syntax, &custom);
+        let line = "fn main() { let s = \"hi\"; let n = 42; } // done\n";
+        let regions = highlighter.highlight_line(line, set).unwrap();
+        let color_of = |needle: &str| -> Color {
+            regions
+                .iter()
+                .find(|(_, text)| text.contains(needle))
+                .map(|(style, _)| style.foreground)
+                .unwrap_or_else(|| panic!("no region for {needle:?}"))
+        };
+        let gray = |value: u8| Color {
+            r: value,
+            g: value,
+            b: value,
+            a: 0xff,
+        };
+        assert_eq!(color_of("fn"), gray(5));
+        assert_eq!(color_of("main"), gray(6));
+        assert_eq!(color_of("hi"), gray(2));
+        assert_eq!(color_of("42"), gray(3));
+        assert_eq!(color_of("done"), gray(1));
     }
 
     #[test]

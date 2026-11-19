@@ -37,7 +37,11 @@ searchable list.
   windows open and the next launch reopens them.
 - **Home view.** `⌘⇧N` opens a window listing your workspaces, newest first
   and searchable; pick one to enter it, or open a new folder.
-- **Themes.** Seven color themes (five dark, two light), switched from the
+- **Drag tabs.** Drag a tab along its strip to reorder it, onto another pane
+  to move it there, or onto the edge of any pane to split a new pane off that
+  side. The terminal or file keeps running as it moves.
+- **Themes.** Thirteen color themes (ten dark, three light), including Owlet,
+  Night Owl, Dracula, One Dark and both Solarized variants, switched from the
   palette button in the title bar and applied to every window at once.
 
 ## Run
@@ -70,6 +74,7 @@ The `claude` and `codex` commands must be on the `PATH` of your login shell.
 | `⌘B` | Toggle the sidebar |
 | `⌘`-click | Open the path or URL under the pointer |
 | Right-click a terminal | Split up / right / down / left, or close it |
+| Drag a tab | Reorder it, move it to another pane, or drop on a pane's edge to split |
 | `⌘C` / `⌘V` / `⌘K` | Copy selection / paste / clear the terminal |
 | `⇧PageUp` / `⇧PageDown` | Scroll back through terminal history |
 | `⇧Enter` | Insert a newline in an agent prompt |
