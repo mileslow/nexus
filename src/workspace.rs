@@ -232,49 +232,52 @@ impl Workspace {
 
     /// The chat running in each agent terminal, so it can be resumed later.
     fn running_chats(&self, cx: &App) -> HashMap<EntityId, SavedChat> {
+        let sessions = self.sessions.read(cx);
+        let agents: Vec<_> = self
+            .terminals(cx)
+            .into_iter()
+            .filter_map(|(_, _, entity)| {
+                let terminal = entity.read(cx);
+                Some((entity.entity_id(), terminal.agent?, entity))
+            })
+            .collect();
         let mut chats = HashMap::new();
-        // Chats already tied to a terminal cannot be another terminal's chat.
-        let mut claimed = HashSet::new();
+        if agents.is_empty() {
+            return chats;
+        }
+        // Chats already tied to a terminal, or open in any other program,
+        // cannot be guessed as another terminal's chat.
+        let live = sessions::live_claude_sessions();
+        let mut claimed: HashSet<String> = live.values().cloned().collect();
         let mut unknown = Vec::new();
-        for (_, _, entity) in self.terminals(cx) {
+
+        for (id, agent, entity) in &agents {
             let terminal = entity.read(cx);
-            let Some(agent) = terminal.agent else {
-                continue;
-            };
-            match &terminal.session_id {
-                Some(id) => {
-                    claimed.insert(id.clone());
-                    chats.insert(
-                        entity.entity_id(),
-                        SavedChat {
-                            agent,
-                            id: id.clone(),
-                            title: terminal
-                                .chat_title()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| terminal.title()),
-                        },
-                    );
+            // Claude Code says exactly which chat a process has open, which
+            // stays right after `/resume` or `/clear` inside the agent.
+            let recorded = (*agent == Agent::Claude)
+                .then(|| live.get(&terminal.foreground_pid()))
+                .flatten()
+                .and_then(|session| sessions.chat(session));
+            let resumed = terminal.session_id.as_ref().map(|session| SavedChat {
+                agent: *agent,
+                id: session.clone(),
+                title: terminal
+                    .chat_title()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| terminal.title()),
+            });
+            match recorded.or(resumed) {
+                Some(chat) => {
+                    claimed.insert(chat.id.clone());
+                    chats.insert(*id, chat);
                 }
-                None => {
-                    if let Some(started) = terminal.agent_started_secs() {
-                        unknown.push((
-                            entity.entity_id(),
-                            agent,
-                            terminal.cwd(),
-                            started,
-                            terminal.last_output_secs(),
-                        ));
-                    }
-                }
+                None => unknown.push((*id, *agent, terminal.cwd(), terminal.agent_started_secs())),
             }
         }
-        // Not resumed by Nexus: work out which chat each one is running,
-        // letting the most recently active terminal choose first.
-        unknown.sort_by(|a, b| b.4.cmp(&a.4));
-        let sessions = self.sessions.read(cx);
-        for (id, agent, cwd, started, last_output) in unknown {
-            if let Some(chat) = sessions.infer_chat(agent, &cwd, started, last_output, &claimed) {
+        for (id, agent, cwd, started) in unknown {
+            let Some(started) = started else { continue };
+            if let Some(chat) = sessions.infer_chat(agent, &cwd, started, &claimed) {
                 claimed.insert(chat.id.clone());
                 chats.insert(id, chat);
             }

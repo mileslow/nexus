@@ -490,9 +490,9 @@ impl TerminalView {
         self.agent_since
     }
 
-    /// When this terminal last printed anything, in Unix seconds.
-    pub fn last_output_secs(&self) -> u64 {
-        crate::sessions::now_secs().saturating_sub(self.last_output.elapsed().as_secs())
+    /// The process currently in the terminal's foreground.
+    pub fn foreground_pid(&self) -> i32 {
+        self.foreground_pid
     }
 
     /// Recomputes the activity indicator. `in_view` is true while the user is

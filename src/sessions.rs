@@ -589,6 +589,47 @@ pub fn format_age(modified: u64, now: u64) -> String {
     }
 }
 
+/// Reads one of Claude Code's per-process records: `(pid, session id)`.
+fn parse_live_record(bytes: &[u8]) -> Option<(i32, String)> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let pid = i32::try_from(value.get("pid")?.as_i64()?).ok()?;
+    let id = value.get("sessionId")?.as_str()?;
+    (pid > 0 && !id.is_empty()).then(|| (pid, id.to_string()))
+}
+
+/// The chat each running Claude Code process has open, by process id.
+///
+/// Claude Code keeps a small record per interactive process in
+/// `~/.claude/sessions/<pid>.json`. That is an exact answer to "which chat
+/// is this terminal running", including after `/resume` or `/clear` inside
+/// the agent. Records left behind by dead processes are ignored.
+pub fn live_claude_sessions() -> HashMap<i32, String> {
+    let mut live = HashMap::new();
+    let Some(home) = home_dir() else {
+        return live;
+    };
+    let Ok(entries) = fs::read_dir(home.join(".claude/sessions")) else {
+        return live;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Some((pid, id)) = fs::read(&path)
+            .ok()
+            .and_then(|bytes| parse_live_record(&bytes))
+        else {
+            continue;
+        };
+        // Signal 0 only asks whether the process exists.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            live.insert(pid, id);
+        }
+    }
+    live
+}
+
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -671,6 +712,21 @@ mod tests {
         let exec = br#"{"type":"session_meta","payload":{"id":"abc","cwd":"/w","source":"exec"}}
 "#;
         assert!(parse_codex(exec, true).is_none());
+    }
+
+    #[test]
+    fn reads_claude_process_records() {
+        let record = br#"{"pid": 4242, "sessionId": "abc-123", "cwd": "/w", "status": "idle"}"#;
+        assert_eq!(
+            parse_live_record(record),
+            Some((4242, "abc-123".to_string()))
+        );
+        assert_eq!(parse_live_record(br#"{"pid": 4242}"#), None);
+        assert_eq!(
+            parse_live_record(br#"{"pid": "x", "sessionId": "a"}"#),
+            None
+        );
+        assert_eq!(parse_live_record(b"not json"), None);
     }
 
     #[test]

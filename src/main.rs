@@ -42,6 +42,16 @@ fn requested_root() -> Option<PathBuf> {
     }
 }
 
+/// Names of environment variables that mark this process as running inside
+/// a Claude Code session.
+fn inherited_agent_variables(
+    names: impl Iterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    names
+        .filter(|name| name.to_string_lossy().starts_with("CLAUDE"))
+        .collect()
+}
+
 fn bind_keys(cx: &mut App) {
     text_input::bind_keys(cx);
     terminal::bind_keys(cx);
@@ -123,13 +133,11 @@ fn menus() -> Vec<Menu> {
 }
 
 fn main() {
-    // Agent CLIs started inside Nexus must not think they are nested inside
-    // whichever agent session happened to launch the app.
-    for name in [
-        "CLAUDECODE",
-        "CLAUDE_CODE_ENTRYPOINT",
-        "CLAUDE_CODE_SSE_PORT",
-    ] {
+    // When Nexus is launched from inside an agent session it inherits that
+    // session's variables, and every Claude started in a Nexus terminal would
+    // then run as a child of it. Terminals are login shells, so anything set
+    // in the user's own shell profile comes back.
+    for name in inherited_agent_variables(std::env::vars_os().map(|(name, _)| name)) {
         std::env::remove_var(name);
     }
     let requested = requested_root();
@@ -167,4 +175,26 @@ fn main() {
                 None => windows::open_home_window(cx),
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_agent_session_variables_are_scrubbed() {
+        let names = [
+            "PATH",
+            "CLAUDECODE",
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDE_PID",
+            "ANTHROPIC_API_KEY",
+            "HOME",
+        ];
+        let scrubbed = inherited_agent_variables(names.iter().map(std::ffi::OsString::from));
+        assert_eq!(
+            scrubbed,
+            vec!["CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_PID"]
+        );
+    }
 }
