@@ -1,6 +1,6 @@
 //! Colors, fonts and metrics shared by every view.
 
-use gpui::{px, rgb, Hsla, Pixels, Rgba};
+use gpui::{px, rgb, rgba, Hsla, Pixels, Rgba};
 
 pub const UI_FONT: &str = ".SystemUIFont";
 pub const MONO_FONT: &str = "Menlo";
@@ -33,10 +33,20 @@ colors! {
     accent = 0x6ea8fe;
     green = 0x7bd88f;
     yellow = 0xe5c07b;
+    red = 0xf2777a;
     claude = 0xe0906a;
     codex = 0x5ad1c2;
     selection = 0x2c4470;
     line_highlight = 0x1b2230;
+}
+
+/// Row tints for the file view's inline diff.
+pub fn diff_added_bg() -> Rgba {
+    rgba(0x7bd88f24)
+}
+
+pub fn diff_removed_bg() -> Rgba {
+    rgba(0xf2777a26)
 }
 
 pub fn hsla(color: Rgba) -> Hsla {

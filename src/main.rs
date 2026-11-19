@@ -1,6 +1,7 @@
 //! Nexus: a fast agent multiplexer / IDE built on GPUI.
 
 mod assets;
+mod diff;
 mod file_tree;
 mod file_view;
 mod layout;

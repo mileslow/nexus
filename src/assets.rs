@@ -20,6 +20,10 @@ const ICONS: &[(&str, &str)] = &[
         icon_svg!(r#"<path d="M6 3.5 10.5 8 6 12.5"/>"#),
     ),
     (
+        "chevron-up",
+        icon_svg!(r#"<path d="M3.5 10 8 5.5 12.5 10"/>"#),
+    ),
+    (
         "chevron-down",
         icon_svg!(r#"<path d="M3.5 6 8 10.5 12.5 6"/>"#),
     ),

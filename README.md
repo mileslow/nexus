@@ -15,6 +15,12 @@ searchable list.
 - **File explorer.** A lazily loaded tree of the open folder. Click a file to
   view it with syntax highlighting; the view reloads when the file changes on
   disk, so you can watch an agent edit it.
+- **Agent diffs.** The file view shows what changed since the last commit
+  inline: added lines in green, removed lines in red, with a `+N −M` count and
+  arrows to step between changes. It updates as the agent keeps editing and
+  clears when the work is committed. The `Diff` button hides the removed lines
+  and leaves a bar beside the added ones. Files outside a git repository are
+  compared with how they looked when you opened them.
 - **⌘-click paths.** Hold `⌘` over a path an agent printed (`src/main.rs:42`,
   `Update(app/page.tsx)`, `b/src/lib.rs`, quoted paths with spaces, URLs) and
   click to open it at that line. Paths are resolved against the terminal's
@@ -69,6 +75,7 @@ onto a terminal pastes their paths.
 | `sessions.rs` | Discovers Claude Code and Codex chats on disk |
 | `session_list.rs` | The searchable chat list |
 | `file_tree.rs`, `file_view.rs` | File explorer and viewer |
+| `diff.rs` | Line diff and the git baseline a file is compared against |
 | `layout.rs`, `pane.rs` | The split tree and tabbed panes |
 | `workspace.rs` | Window root: title bar, sidebar, actions |
 
@@ -92,7 +99,7 @@ cargo test
 ```
 
 Unit tests cover the non-UI logic: path detection, key and mouse encoding,
-session-log parsing, chat filtering and the pane layout tree.
+session-log parsing, chat filtering, line diffing and the pane layout tree.
 
 ## Not yet
 

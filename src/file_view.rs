@@ -1,5 +1,6 @@
 //! A read-only file viewer: virtualized lines, background syntax
-//! highlighting, jump-to-line, and automatic reload when the file changes.
+//! highlighting, jump-to-line, automatic reload when the file changes, and an
+//! inline diff of what changed since the last commit.
 
 use std::fs;
 use std::ops::Range;
@@ -19,6 +20,8 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
 use syntect::parsing::SyntaxSet;
 
+use crate::assets::icon;
+use crate::diff::{self, Baseline, Diff, RowKind};
 use crate::theme;
 
 const MAX_FILE_BYTES: u64 = 24 * 1024 * 1024;
@@ -29,14 +32,28 @@ const LINE_HEIGHT: f32 = 19.;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg"];
 
 type LineHighlights = Arc<[(Range<usize>, Hsla)]>;
+type Lines = Arc<Vec<SharedString>>;
+
+/// How the file differs from its baseline.
+struct Changes {
+    base: Lines,
+    diff: Diff,
+    /// The widest row of the unified view, for horizontal scrolling.
+    longest_row: usize,
+}
+
+struct TextContent {
+    lines: Lines,
+    highlights: Vec<Option<LineHighlights>>,
+    longest: usize,
+    changes: Option<Changes>,
+    /// What the file is compared against, shown beside the path.
+    baseline_note: Option<&'static str>,
+}
 
 enum Content {
     Loading,
-    Text {
-        lines: Arc<Vec<SharedString>>,
-        highlights: Vec<Option<LineHighlights>>,
-        longest: usize,
-    },
+    Text(TextContent),
     Image,
     Message(SharedString),
 }
@@ -50,6 +67,17 @@ enum Loaded {
     Message(SharedString),
 }
 
+/// Everything read from disk for one (re)load, gathered off the UI thread.
+struct Snapshot {
+    loaded: Loaded,
+    mtime: Option<SystemTime>,
+    changes: Option<Changes>,
+    baseline_note: Option<&'static str>,
+    in_repository: bool,
+    git_watch: Option<PathBuf>,
+    git_stamp: Option<SystemTime>,
+}
+
 pub struct FileView {
     path: PathBuf,
     /// Shown above the content; relative to the workspace when possible.
@@ -57,9 +85,17 @@ pub struct FileView {
     focus_handle: FocusHandle,
     content: Content,
     scroll: UniformListScrollHandle,
+    /// Zero-based line (of the current file) to highlight.
     highlighted_line: Option<usize>,
     pending_scroll: Option<usize>,
+    /// Show removed lines inline. Off shows the plain file with change marks.
+    show_diff: bool,
+    hunk_cursor: Option<usize>,
+    /// The text when the view first loaded: the baseline outside git.
+    opened: Option<Lines>,
     mtime: Option<SystemTime>,
+    git_watch: Option<PathBuf>,
+    git_stamp: Option<SystemTime>,
     checking: bool,
     cancel_highlight: Arc<AtomicBool>,
     _load: Option<Task<()>>,
@@ -92,6 +128,32 @@ fn syntax_theme() -> &'static Theme {
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|meta| meta.modified()).ok()
+}
+
+/// Splits file bytes into display lines and finds the longest. `None` for
+/// binary data.
+fn text_lines(bytes: &[u8]) -> Option<(Vec<SharedString>, usize)> {
+    if bytes.iter().take(8192).any(|&byte| byte == 0) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let mut longest = 0;
+    let mut longest_len = 0;
+    let mut lines: Vec<SharedString> = Vec::new();
+    for (index, raw) in text.split('\n').enumerate() {
+        let line = prepare_line(raw.strip_suffix('\r').unwrap_or(raw));
+        if line.len() > longest_len {
+            longest_len = line.len();
+            longest = index;
+        }
+        lines.push(line.into());
+    }
+    // A trailing newline is not an extra empty line.
+    if lines.len() > 1 && lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+        longest = longest.min(lines.len() - 1);
+    }
+    Some((lines, longest))
 }
 
 fn load(path: &Path) -> (Loaded, Option<SystemTime>) {
@@ -131,28 +193,75 @@ fn load(path: &Path) -> (Loaded, Option<SystemTime>) {
             )
         }
     };
-    if bytes.iter().take(8192).any(|&byte| byte == 0) {
-        return (Loaded::Message("Binary file — no preview.".into()), mtime);
+    match text_lines(&bytes) {
+        Some((lines, longest)) => (Loaded::Text { lines, longest }, mtime),
+        None => (Loaded::Message("Binary file — no preview.".into()), mtime),
     }
+}
 
-    let text = String::from_utf8_lossy(&bytes);
-    let mut longest = 0;
-    let mut longest_len = 0;
-    let mut lines: Vec<SharedString> = Vec::new();
-    for (index, raw) in text.split('\n').enumerate() {
-        let line = prepare_line(raw.strip_suffix('\r').unwrap_or(raw));
-        if line.len() > longest_len {
-            longest_len = line.len();
-            longest = index;
+/// Diffs `lines` against `base`. `None` when nothing changed.
+fn changes_against(base: Lines, lines: &[SharedString], longest: usize) -> Option<Changes> {
+    let diff = diff::diff_lines(&base, lines)?;
+    let mut longest_row = diff.row_of_line.get(longest).copied().unwrap_or(0) as usize;
+    let mut longest_len = lines.get(longest).map_or(0, |line| line.len());
+    for (row_index, row) in diff.rows.iter().enumerate() {
+        if row.kind == RowKind::Removed {
+            let len = base[row.index as usize].len();
+            if len > longest_len {
+                longest_len = len;
+                longest_row = row_index;
+            }
         }
-        lines.push(line.into());
     }
-    // A trailing newline is not an extra empty line.
-    if lines.len() > 1 && lines.last().is_some_and(|line| line.is_empty()) {
-        lines.pop();
-        longest = longest.min(lines.len() - 1);
-    }
-    (Loaded::Text { lines, longest }, mtime)
+    Some(Changes {
+        base,
+        diff,
+        longest_row,
+    })
+}
+
+/// Reads the file and works out what changed. `opened` is the text from when
+/// the view first loaded, used as the baseline for files outside git.
+fn snapshot(path: &Path, opened: Option<Lines>) -> Snapshot {
+    let (loaded, mtime) = load(path);
+    let mut snapshot = Snapshot {
+        loaded,
+        mtime,
+        changes: None,
+        baseline_note: None,
+        in_repository: false,
+        git_watch: None,
+        git_stamp: None,
+    };
+    let Loaded::Text { lines, longest } = &snapshot.loaded else {
+        return snapshot;
+    };
+
+    let git = diff::git_state(path);
+    snapshot.git_stamp = git.watch.as_deref().and_then(file_mtime);
+    snapshot.git_watch = git.watch;
+    snapshot.in_repository = git.baseline != Baseline::NoRepository;
+    let base = match git.baseline {
+        Baseline::Head(bytes) => {
+            snapshot.baseline_note = Some("vs last commit");
+            (bytes.len() as u64 <= MAX_FILE_BYTES)
+                .then(|| text_lines(&bytes))
+                .flatten()
+                .map(|(base, _)| Arc::new(base))
+        }
+        Baseline::Untracked => {
+            snapshot.baseline_note = Some("not committed yet");
+            None
+        }
+        Baseline::NoRepository => {
+            if opened.is_some() {
+                snapshot.baseline_note = Some("since opened");
+            }
+            opened
+        }
+    };
+    snapshot.changes = base.and_then(|base| changes_against(base, lines, *longest));
+    snapshot
 }
 
 /// Expands tabs and bounds pathological line lengths (minified bundles).
@@ -268,7 +377,12 @@ impl FileView {
             scroll: UniformListScrollHandle::new(),
             highlighted_line: None,
             pending_scroll: None,
+            show_diff: true,
+            hunk_cursor: None,
+            opened: None,
             mtime: None,
+            git_watch: None,
+            git_stamp: None,
             checking: false,
             cancel_highlight: Arc::new(AtomicBool::new(false)),
             _load: None,
@@ -291,6 +405,32 @@ impl FileView {
             .into()
     }
 
+    /// The changes being shown inline, if the unified view is on.
+    fn shown_changes(&self) -> Option<&Changes> {
+        match &self.content {
+            Content::Text(text) if self.show_diff => text.changes.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The list row that displays a zero-based line of the current file.
+    fn row_for_line(&self, line: usize) -> usize {
+        let Content::Text(text) = &self.content else {
+            return line;
+        };
+        let line = line.min(text.lines.len().saturating_sub(1));
+        match self.shown_changes() {
+            Some(changes) => changes.diff.row_of_line[line] as usize,
+            None => line,
+        }
+    }
+
+    /// The list row currently at the top of the viewport.
+    fn top_row(&self) -> usize {
+        let offset = self.scroll.0.borrow().base_handle.offset().y;
+        (-f32::from(offset) / LINE_HEIGHT).max(0.).round() as usize
+    }
+
     /// Scrolls to and highlights a 1-based line number.
     pub fn go_to_line(&mut self, line: Option<u32>, cx: &mut Context<Self>) {
         let Some(line) = line.filter(|&line| line > 0) else {
@@ -298,53 +438,113 @@ impl FileView {
         };
         let index = line as usize - 1;
         self.highlighted_line = Some(index);
-        match &self.content {
-            Content::Text { lines, .. } => {
-                self.scroll.scroll_to_item_strict(
-                    index.min(lines.len().saturating_sub(1)),
-                    ScrollStrategy::Center,
-                );
-            }
-            _ => self.pending_scroll = Some(index),
+        if matches!(self.content, Content::Text(_)) {
+            self.scroll
+                .scroll_to_item_strict(self.row_for_line(index), ScrollStrategy::Center);
+        } else {
+            self.pending_scroll = Some(index);
         }
+        cx.notify();
+    }
+
+    /// Switches between the unified diff and the plain file, keeping the
+    /// same part of the file on screen.
+    fn toggle_diff(&mut self, cx: &mut Context<Self>) {
+        let Content::Text(text) = &self.content else {
+            return;
+        };
+        let Some(changes) = &text.changes else {
+            return;
+        };
+        let top = self.top_row();
+        let new_top = if self.show_diff {
+            changes.diff.line_of_row(top)
+        } else {
+            let line = top.min(text.lines.len().saturating_sub(1));
+            changes.diff.row_of_line[line] as usize
+        };
+        self.show_diff = !self.show_diff;
+        self.scroll
+            .scroll_to_item_strict(new_top, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Scrolls to the next (`+1`) or previous (`-1`) run of changes.
+    fn step_change(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Content::Text(text) = &self.content else {
+            return;
+        };
+        let Some(changes) = &text.changes else {
+            return;
+        };
+        let count = changes.diff.hunks.len() as isize;
+        if count == 0 {
+            return;
+        }
+        let next = match self.hunk_cursor {
+            Some(current) => (current as isize + delta).rem_euclid(count),
+            None if delta < 0 => count - 1,
+            None => 0,
+        } as usize;
+        let row = changes.diff.hunks[next] as usize;
+        let target = if self.show_diff {
+            row
+        } else {
+            changes.diff.line_of_row(row)
+        };
+        self.hunk_cursor = Some(next);
+        self.scroll
+            .scroll_to_item_strict(target, ScrollStrategy::Center);
         cx.notify();
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
+        let opened = self.opened.clone();
         self._load = Some(cx.spawn(async move |this, cx| {
-            let (loaded, mtime) = cx.background_spawn(async move { load(&path) }).await;
-            let _ = this.update(cx, |this, cx| this.apply(loaded, mtime, cx));
+            let snapshot = cx
+                .background_spawn(async move { snapshot(&path, opened) })
+                .await;
+            let _ = this.update(cx, |this, cx| this.apply(snapshot, cx));
         }));
     }
 
-    fn apply(&mut self, loaded: Loaded, mtime: Option<SystemTime>, cx: &mut Context<Self>) {
-        self.mtime = mtime;
+    fn apply(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        self.mtime = snapshot.mtime;
+        self.git_watch = snapshot.git_watch;
+        self.git_stamp = snapshot.git_stamp;
         self.cancel_highlight.store(true, Ordering::Relaxed);
         self._highlight = None;
-        self.content = match loaded {
+        self.content = match snapshot.loaded {
             Loaded::Image => Content::Image,
             Loaded::Message(message) => Content::Message(message),
             Loaded::Text { lines, longest } => {
                 let lines = Arc::new(lines);
-                if let Some(index) = self.pending_scroll.take() {
-                    self.scroll.scroll_to_item_strict(
-                        index.min(lines.len().saturating_sub(1)),
-                        ScrollStrategy::Center,
-                    );
+                if !snapshot.in_repository && self.opened.is_none() {
+                    self.opened = Some(lines.clone());
                 }
                 self.start_highlighting(lines.clone(), cx);
-                Content::Text {
+                Content::Text(TextContent {
                     highlights: vec![None; lines.len()],
                     lines,
                     longest,
-                }
+                    changes: snapshot.changes,
+                    baseline_note: snapshot.baseline_note,
+                })
             }
         };
+        // The set of changes may be different now.
+        self.hunk_cursor = None;
+        if matches!(self.content, Content::Text(_)) {
+            if let Some(index) = self.pending_scroll.take() {
+                self.scroll
+                    .scroll_to_item_strict(self.row_for_line(index), ScrollStrategy::Center);
+            }
+        }
         cx.notify();
     }
 
-    fn start_highlighting(&mut self, lines: Arc<Vec<SharedString>>, cx: &mut Context<Self>) {
+    fn start_highlighting(&mut self, lines: Lines, cx: &mut Context<Self>) {
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_highlight = cancel.clone();
         let path = self.path.clone();
@@ -359,20 +559,15 @@ impl FileView {
         self._highlight = Some(cx.spawn(async move |this, cx| {
             while let Some((start, chunk)) = rx.next().await {
                 let applied = this.update(cx, |this, cx| {
-                    let Content::Text {
-                        lines: current,
-                        highlights,
-                        ..
-                    } = &mut this.content
-                    else {
+                    let Content::Text(text) = &mut this.content else {
                         return false;
                     };
                     // A reload replaced the text these spans were computed for.
-                    if !Arc::ptr_eq(current, &lines) {
+                    if !Arc::ptr_eq(&text.lines, &lines) {
                         return false;
                     }
                     for (offset, spans) in chunk.into_iter().enumerate() {
-                        if let Some(slot) = highlights.get_mut(start + offset) {
+                        if let Some(slot) = text.highlights.get_mut(start + offset) {
                             *slot = Some(spans);
                         }
                     }
@@ -386,16 +581,22 @@ impl FileView {
         }));
     }
 
-    /// Reloads the file if it changed on disk since it was read.
+    /// Reloads if the file changed on disk, or if a commit, checkout or
+    /// reset moved the baseline it is compared against.
     pub fn check_for_changes(&mut self, cx: &mut Context<Self>) {
         if self.checking || matches!(self.content, Content::Loading) {
             return;
         }
         self.checking = true;
         let path = self.path.clone();
-        let known = self.mtime;
+        let git_watch = self.git_watch.clone();
+        let known = (self.mtime, self.git_stamp);
         cx.spawn(async move |this, cx| {
-            let current = cx.background_spawn(async move { file_mtime(&path) }).await;
+            let current = cx
+                .background_spawn(async move {
+                    (file_mtime(&path), git_watch.as_deref().and_then(file_mtime))
+                })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 this.checking = false;
                 if current != known {
@@ -417,18 +618,46 @@ impl FileView {
         range: Range<usize>,
         gutter_width: gpui::Pixels,
     ) -> Vec<impl IntoElement + use<>> {
-        let Content::Text {
-            lines, highlights, ..
-        } = &self.content
-        else {
+        let Content::Text(text) = &self.content else {
             return Vec::new();
         };
+        let shown = self.shown_changes();
         range
-            .map(|index| {
-                let line = lines[index].clone();
-                let text = match highlights.get(index).and_then(|spans| spans.as_ref()) {
-                    Some(spans) if !spans.is_empty() => {
-                        StyledText::new(line).with_highlights(spans.iter().map(|(range, color)| {
+            .map(|row_index| {
+                // Resolve the row to a kind, a line number and its text.
+                let (kind, line_index, number, content) = match shown {
+                    Some(changes) => {
+                        let row = changes.diff.rows[row_index];
+                        let index = row.index as usize;
+                        match row.kind {
+                            RowKind::Removed => {
+                                (row.kind, None, index + 1, changes.base[index].clone())
+                            }
+                            kind => (kind, Some(index), index + 1, text.lines[index].clone()),
+                        }
+                    }
+                    None => {
+                        let added = text
+                            .changes
+                            .as_ref()
+                            .is_some_and(|changes| changes.diff.line_added[row_index]);
+                        let kind = if added { RowKind::Added } else { RowKind::Same };
+                        (
+                            kind,
+                            Some(row_index),
+                            row_index + 1,
+                            text.lines[row_index].clone(),
+                        )
+                    }
+                };
+
+                let spans = line_index
+                    .and_then(|index| text.highlights.get(index))
+                    .and_then(|spans| spans.as_ref())
+                    .filter(|spans| !spans.is_empty());
+                let styled = match spans {
+                    Some(spans) => StyledText::new(content).with_highlights(spans.iter().map(
+                        |(range, color)| {
                             (
                                 range.clone(),
                                 HighlightStyle {
@@ -436,35 +665,159 @@ impl FileView {
                                     ..Default::default()
                                 },
                             )
-                        }))
-                    }
-                    _ => StyledText::new(line),
+                        },
+                    )),
+                    None => StyledText::new(content),
                 };
+
+                let highlighted = line_index.is_some() && line_index == self.highlighted_line;
+                let unified = shown.is_some();
+                let background = if highlighted {
+                    Some(theme::line_highlight())
+                } else if unified && kind == RowKind::Added {
+                    Some(theme::diff_added_bg())
+                } else if kind == RowKind::Removed {
+                    Some(theme::diff_removed_bg())
+                } else {
+                    None
+                };
+                let marker = match (kind, unified) {
+                    (RowKind::Added, true) => div()
+                        .text_color(theme::green())
+                        .child("+")
+                        .into_any_element(),
+                    (RowKind::Removed, _) => {
+                        div().text_color(theme::red()).child("−").into_any_element()
+                    }
+                    // With removed lines hidden, a bar marks what was added.
+                    (RowKind::Added, false) => div()
+                        .w(px(2.))
+                        .h(px(LINE_HEIGHT - 4.))
+                        .bg(theme::green())
+                        .into_any_element(),
+                    (RowKind::Same, _) => div().into_any_element(),
+                };
+                let number_color = match kind {
+                    _ if highlighted => theme::text_muted(),
+                    RowKind::Removed => Rgba {
+                        a: 0.55,
+                        ..theme::red()
+                    },
+                    _ => theme::text_faint(),
+                };
+
                 div()
                     .h(px(LINE_HEIGHT))
+                    // Fill the pane so row tints reach its right edge.
+                    .w_full()
                     .flex()
                     .items_center()
                     .whitespace_nowrap()
-                    .when(self.highlighted_line == Some(index), |row| {
-                        row.bg(theme::line_highlight())
-                    })
+                    .when_some(background, |row, color| row.bg(color))
                     .child(
                         div()
                             .w(gutter_width)
                             .flex_none()
                             .flex()
+                            .items_center()
                             .justify_end()
-                            .pr(px(14.))
-                            .text_color(if self.highlighted_line == Some(index) {
-                                theme::text_muted()
-                            } else {
-                                theme::text_faint()
-                            })
-                            .child(SharedString::from((index + 1).to_string())),
+                            .text_color(number_color)
+                            .child(SharedString::from(number.to_string()))
+                            .child(
+                                div()
+                                    .w(px(20.))
+                                    .flex_none()
+                                    .flex()
+                                    .justify_center()
+                                    .child(marker),
+                            ),
                     )
-                    .child(div().pr(px(24.)).child(text))
+                    .child(
+                        div()
+                            .pr(px(24.))
+                            .when(kind == RowKind::Removed, |line| {
+                                line.text_color(theme::text_muted())
+                            })
+                            .child(styled),
+                    )
             })
             .collect()
+    }
+
+    /// The change summary and controls shown beside the path.
+    fn render_change_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let Content::Text(text) = &self.content else {
+            return None;
+        };
+        let note = text.baseline_note;
+        let Some(changes) = &text.changes else {
+            // Nothing changed: just say what it was compared against, if
+            // that is itself informative.
+            return note
+                .filter(|note| *note == "not committed yet")
+                .map(|note| div().flex_none().child(note).into_any_element());
+        };
+
+        let small_button = |id: &'static str, name: &'static str| {
+            div()
+                .id(id)
+                .size(px(20.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::bg_active()))
+                .child(icon(name, px(12.), theme::text_muted()))
+        };
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .text_color(theme::green())
+                        .child(SharedString::from(format!("+{}", changes.diff.added))),
+                )
+                .child(
+                    div()
+                        .text_color(theme::red())
+                        .child(SharedString::from(format!("−{}", changes.diff.removed))),
+                )
+                .when_some(note, |bar, note| bar.child(note))
+                .child(
+                    small_button("previous-change", "chevron-up")
+                        .on_click(cx.listener(|this, _, _, cx| this.step_change(-1, cx))),
+                )
+                .child(
+                    small_button("next-change", "chevron-down")
+                        .on_click(cx.listener(|this, _, _, cx| this.step_change(1, cx))),
+                )
+                .child(
+                    div()
+                        .id("toggle-diff")
+                        .h(px(18.))
+                        .px(px(7.))
+                        .flex()
+                        .items_center()
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .map(|chip| {
+                            if self.show_diff {
+                                chip.bg(theme::bg_active()).text_color(theme::text())
+                            } else {
+                                chip.text_color(theme::text_muted())
+                                    .hover(|style| style.bg(theme::bg_hover()))
+                            }
+                        })
+                        .child("Diff")
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_diff(cx))),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -493,23 +846,32 @@ impl Render for FileView {
                         .object_fit(ObjectFit::Contain),
                 )
                 .into_any_element(),
-            Content::Text { lines, longest, .. } => {
-                let digits = lines.len().max(1).to_string().len().max(3);
-                let gutter_width = px(digits as f32 * 7.6 + 30.);
+            Content::Text(text) => {
+                let (row_count, widest_row, last_number) = match self.shown_changes() {
+                    Some(changes) => (
+                        changes.diff.rows.len(),
+                        changes.longest_row,
+                        text.lines.len().max(changes.base.len()),
+                    ),
+                    None => (text.lines.len(), text.longest, text.lines.len()),
+                };
+                let digits = last_number.max(1).to_string().len().max(3);
+                let gutter_width = px(digits as f32 * 7.6 + 36.);
                 uniform_list(
                     "file-lines",
-                    lines.len(),
+                    row_count,
                     cx.processor(move |this, range: Range<usize>, _window, _cx| {
                         this.render_lines(range, gutter_width)
                     }),
                 )
                 .track_scroll(self.scroll.clone())
                 .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-                .with_width_from_item(Some(*longest))
+                .with_width_from_item(Some(widest_row))
                 .size_full()
                 .into_any_element()
             }
         };
+        let change_bar = self.render_change_bar(cx);
 
         div()
             .size_full()
@@ -524,6 +886,7 @@ impl Render for FileView {
                     .flex_none()
                     .flex()
                     .items_center()
+                    .gap(px(10.))
                     .px_3()
                     .border_b_1()
                     .border_color(theme::border())
@@ -532,12 +895,15 @@ impl Render for FileView {
                     .child(
                         div()
                             .id("file-path")
+                            .min_w_0()
                             .truncate()
                             .cursor_pointer()
                             .hover(|style| style.text_color(theme::text_muted()))
                             .child(self.display_path.clone())
                             .on_click(cx.listener(|this, _, _, cx| this.copy_path(cx))),
-                    ),
+                    )
+                    .child(div().flex_1())
+                    .children(change_bar),
             )
             .child(
                 div()
@@ -555,6 +921,13 @@ impl Render for FileView {
 mod tests {
     use super::*;
 
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nexus-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn tabs_expand_to_stops_and_long_lines_truncate() {
         assert_eq!(prepare_line("\ta\tb"), "    a   b");
@@ -564,8 +937,7 @@ mod tests {
 
     #[test]
     fn loads_text_and_reports_binary() {
-        let dir = std::env::temp_dir().join(format!("nexus-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("load");
         let text_path = dir.join("a.txt");
         fs::write(&text_path, "one\r\ntwo longer\n").unwrap();
         match load(&text_path).0 {
@@ -580,6 +952,40 @@ mod tests {
         assert!(matches!(load(&binary_path).0, Loaded::Message(_)));
         assert!(matches!(load(&dir.join("missing")).0, Loaded::Message(_)));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn outside_git_changes_are_measured_from_when_the_file_was_opened() {
+        let dir = temp_dir("opened");
+        let path = dir.join("notes.txt");
+        fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        // First load: nothing to compare against yet.
+        let first = snapshot(&path, None);
+        assert!(!first.in_repository);
+        assert!(first.changes.is_none());
+        let Loaded::Text { lines, .. } = first.loaded else {
+            panic!("expected text")
+        };
+        let opened: Lines = Arc::new(lines);
+
+        fs::write(&path, "one\n2\nthree\nfour\n").unwrap();
+        let second = snapshot(&path, Some(opened));
+        assert_eq!(second.baseline_note, Some("since opened"));
+        let changes = second.changes.expect("file changed");
+        assert_eq!((changes.diff.added, changes.diff.removed), (2, 1));
+        assert_eq!(changes.base[1], SharedString::from("two"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_widest_row_can_be_a_removed_line() {
+        let base: Lines = Arc::new(vec!["short".into(), "a much longer removed line".into()]);
+        let lines: Vec<SharedString> = vec!["short".into(), "new".into()];
+        let changes = changes_against(base, &lines, 0).unwrap();
+        // Rows: same "short", removed long line, added "new".
+        assert_eq!(changes.longest_row, 1);
+        assert_eq!(changes.diff.rows.len(), 3);
     }
 
     #[test]
