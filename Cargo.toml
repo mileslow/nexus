@@ -1,0 +1,22 @@
+[package]
+name = "nexus"
+version = "0.1.0"
+edition = "2021"
+description = "A fast agent multiplexer / IDE built with Rust and GPUI"
+
+[dependencies]
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+alacritty_terminal = "0.26"
+
+[profile.dev]
+debug = false
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = true
+codegen-units = 16
