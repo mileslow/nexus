@@ -1,7 +1,7 @@
 //! The searchable list of Claude Code and Codex chats.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use gpui::{
     ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window,
 };
 
+use crate::app_state::SavedChat;
 use crate::assets::icon;
 use crate::sessions::{self, Agent, Session};
 use crate::text_input::{TextInput, TextInputEvent};
@@ -77,6 +78,37 @@ pub fn filter_sessions(
         .collect()
 }
 
+/// See [`SessionList::infer_chat`]. `created` reports when a session log was
+/// created, in seconds since the Unix epoch.
+pub fn infer_chat(
+    sessions: &[Session],
+    agent: Agent,
+    cwd: &Path,
+    agent_started: u64,
+    claimed: &HashSet<String>,
+    created: &dyn Fn(&Path) -> Option<u64>,
+) -> Option<SavedChat> {
+    // Clocks and file timestamps are only this precise.
+    const SLACK: u64 = 5;
+    let cwd = cwd.to_string_lossy();
+    let cwd = cwd.trim_end_matches('/');
+    sessions
+        .iter()
+        .filter(|session| {
+            session.agent == agent
+                && session.cwd.trim_end_matches('/') == cwd
+                && session.modified + SLACK >= agent_started
+                && !claimed.contains(&session.id)
+        })
+        .filter(|session| created(&session.path).is_some_and(|at| at + SLACK >= agent_started))
+        .max_by_key(|session| session.modified)
+        .map(|session| SavedChat {
+            agent,
+            id: session.id.clone(),
+            title: session.title.clone(),
+        })
+}
+
 impl SessionList {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| TextInput::new("Search chats", cx));
@@ -130,10 +162,32 @@ impl SessionList {
         }
     }
 
-    pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        self.root = root;
-        self.refilter(cx);
-        cx.notify();
+    /// Works out which chat an agent is running when it was not started by
+    /// resuming one: the most recently active chat of that agent, in that
+    /// folder, whose log was created after the agent started.
+    pub fn infer_chat(
+        &self,
+        agent: Agent,
+        cwd: &Path,
+        agent_started: u64,
+        claimed: &HashSet<String>,
+    ) -> Option<SavedChat> {
+        infer_chat(
+            &self.sessions,
+            agent,
+            cwd,
+            agent_started,
+            claimed,
+            &|path| {
+                let created = std::fs::metadata(path).ok()?.created().ok()?;
+                Some(
+                    created
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_secs(),
+                )
+            },
+        )
     }
 
     /// Marks which chats are currently open in a terminal.
@@ -428,6 +482,46 @@ mod tests {
                 agent.label().to_lowercase()
             ),
         }
+    }
+
+    #[test]
+    fn infers_the_chat_an_agent_started_itself() {
+        let mut older = session(Agent::Claude, "older chat", "/work/app");
+        older.modified = 500;
+        older.path = "/logs/older".into();
+        let mut current = session(Agent::Claude, "current chat", "/work/app/");
+        current.modified = 900;
+        current.path = "/logs/current".into();
+        let mut elsewhere = session(Agent::Claude, "other folder", "/work/site");
+        elsewhere.modified = 950;
+        elsewhere.path = "/logs/elsewhere".into();
+        let mut codex = session(Agent::Codex, "codex chat", "/work/app");
+        codex.modified = 960;
+        codex.path = "/logs/codex".into();
+        let sessions = vec![older, current, elsewhere, codex];
+        // `older` was created long before the agent started at t=800.
+        let created = |path: &Path| match path.to_str()? {
+            "/logs/older" => Some(100),
+            "/logs/current" => Some(810),
+            _ => Some(900),
+        };
+        let infer = |started: u64, claimed: &[&str]| {
+            let claimed: HashSet<String> = claimed.iter().map(|id| id.to_string()).collect();
+            infer_chat(
+                &sessions,
+                Agent::Claude,
+                Path::new("/work/app"),
+                started,
+                &claimed,
+                &created,
+            )
+            .map(|chat| chat.title)
+        };
+        assert_eq!(infer(800, &[]).as_deref(), Some("current chat"));
+        // Already shown in another terminal: not this one's chat.
+        assert_eq!(infer(800, &["current chat"]), None);
+        // Nothing was created after an agent that started later.
+        assert_eq!(infer(2000, &[]), None);
     }
 
     #[test]

@@ -256,7 +256,7 @@ impl Element for TerminalElement {
             };
             let block = Bounds::new(origin, size(width, line_height));
             cursor_bounds = Some(block);
-            let color = rgb(theme::TERM_CURSOR);
+            let color = rgb(theme::term_cursor());
             if !self.focused {
                 cursor.push(outline(block, color, BorderStyle::Solid));
             } else {
@@ -265,7 +265,7 @@ impl Element for TerminalElement {
                         cursor.push(fill(block, color));
                         if snapshot_cursor.text != ' ' {
                             let style = CellStyle {
-                                fg: rgb(theme::TERM_BG).into(),
+                                fg: rgb(theme::term_bg()).into(),
                                 bold: snapshot_cursor.bold,
                                 italic: false,
                                 underline: false,
@@ -299,7 +299,7 @@ impl Element for TerminalElement {
         let marked_text = marked.and_then(|text| {
             let origin = cursor_bounds?.origin;
             let style = CellStyle {
-                fg: rgb(theme::TERM_FG).into(),
+                fg: rgb(theme::term_fg()).into(),
                 bold: false,
                 italic: false,
                 underline: true,
@@ -397,7 +397,7 @@ impl Element for TerminalElement {
                 let _ = line.paint(*origin, line_height, window, cx);
             }
             if let Some((rect, line)) = &state.marked_text {
-                window.paint_quad(fill(*rect, rgb(theme::TERM_BG)));
+                window.paint_quad(fill(*rect, rgb(theme::term_bg())));
                 let _ = line.paint(rect.origin, line_height, window, cx);
             }
             if let Some(rect) = state.scrollbar {
@@ -476,7 +476,7 @@ fn snapshot(view: &TerminalView, size: TermSize) -> Snapshot {
         };
         if flags.contains(Flags::INVERSE) {
             let old_fg = fg;
-            fg = bg.unwrap_or_else(|| rgb(theme::TERM_BG).into());
+            fg = bg.unwrap_or_else(|| rgb(theme::term_bg()).into());
             bg = Some(old_fg);
         }
         if flags.contains(Flags::DIM) {
@@ -604,7 +604,7 @@ pub fn default_color(index: usize) -> Rgb {
         }
     }
     match index {
-        0..=15 => hex(theme::ANSI[index]),
+        0..=15 => hex(theme::ansi(index)),
         16..=231 => {
             let index = index - 16;
             let level = |value: usize| {
@@ -629,13 +629,13 @@ pub fn default_color(index: usize) -> Rgb {
             }
         }
         // NamedColor::Foreground = 256, Background, Cursor, Dim*, BrightForeground, DimForeground.
-        256 => hex(theme::TERM_FG),
-        257 => hex(theme::TERM_BG),
-        258 => hex(theme::TERM_CURSOR),
-        259..=266 => dim(hex(theme::ANSI[index - 259])),
+        256 => hex(theme::term_fg()),
+        257 => hex(theme::term_bg()),
+        258 => hex(theme::term_cursor()),
+        259..=266 => dim(hex(theme::ansi(index - 259))),
         267 => hex(0xffffff),
-        268 => dim(hex(theme::TERM_FG)),
-        _ => hex(theme::TERM_FG),
+        268 => dim(hex(theme::term_fg())),
+        _ => hex(theme::term_fg()),
     }
 }
 

@@ -12,17 +12,20 @@ use gpui::{
     Window,
 };
 
+use crate::app_state::{SavedAxis, SavedChat, SavedLayout, SavedNode, SavedTab, Store};
 use crate::assets::icon;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::file_view::FileView;
+use crate::home::display_path;
 use crate::layout::{Direction, Node};
 use crate::links::{self, LinkTarget};
 use crate::pane::{icon_button, status_color, terminal_glyph, Pane, PaneEvent, PaneItem};
 use crate::session_list::{SessionList, SessionListEvent};
-use crate::sessions::{Agent, Session};
-use crate::state;
+use crate::sessions::{self, Agent, Session};
 use crate::terminal::{SpawnOptions, TerminalView};
 use crate::theme;
+use crate::theme_picker::ThemePicker;
+use crate::windows;
 
 actions!(
     nexus,
@@ -40,6 +43,7 @@ actions!(
         ToggleSidebar,
         SearchChats,
         OpenFolder,
+        NewWindow,
         Quit,
         SelectTerminal1,
         SelectTerminal2,
@@ -54,6 +58,8 @@ actions!(
 );
 
 const TICK: Duration = Duration::from_millis(700);
+/// Save the layout every this many ticks (about two seconds).
+const SAVE_EVERY: usize = 3;
 const SIDEBAR_MIN: f32 = 190.;
 const SIDEBAR_MAX: f32 = 620.;
 
@@ -92,6 +98,8 @@ pub struct Workspace {
     window_active: bool,
     /// The right-click menu for a terminal, while it is open.
     terminal_menu: Option<TerminalMenu>,
+    theme_picker: Entity<ThemePicker>,
+    ticks: usize,
     _tick: Task<()>,
 }
 
@@ -174,10 +182,255 @@ impl Workspace {
             next_split_id: 0,
             window_active: true,
             terminal_menu: None,
+            theme_picker: cx.new(|_| ThemePicker::new()),
+            ticks: 0,
             _tick: tick,
         };
-        this.spawn_terminal(&pane, None, window, cx);
+
+        // Come back the way this workspace was left, if it has been open before.
+        match cx.global::<Store>().layout_for(&this.root) {
+            Some(layout) => this.restore(layout, window, cx),
+            None => this.spawn_terminal(&pane, None, window, cx),
+        }
+
+        let root = this.root.clone();
+        let handle = window.window_handle();
+        cx.update_global::<Store, _>(|store, _| store.workspace_opened(&root, handle));
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = weak.update(cx, |workspace, cx| workspace.window_closing(cx));
+            true
+        });
+        cx.on_app_quit(|workspace, cx| {
+            workspace.save_layout(cx);
+            async {}
+        })
+        .detach();
         this
+    }
+
+    // ---- remembered layout --------------------------------------------------
+
+    /// Describes the current panes, tabs and sidebar so they can be rebuilt.
+    fn snapshot(&self, cx: &App) -> SavedLayout {
+        // Chats already tied to a terminal cannot be another terminal's chat.
+        let mut claimed: HashSet<String> = self
+            .terminals(cx)
+            .iter()
+            .filter_map(|(_, _, terminal)| terminal.read(cx).session_id.clone())
+            .collect();
+        let tree = self.snapshot_node(&self.center, &mut claimed, cx);
+        SavedLayout {
+            sidebar_width: f32::from(self.sidebar_width),
+            sidebar_visible: self.sidebar_visible,
+            collapsed: self.collapsed,
+            tree,
+            active_pane: self
+                .panes()
+                .iter()
+                .position(|pane| *pane == self.active_pane)
+                .unwrap_or(0),
+        }
+    }
+
+    fn snapshot_node(
+        &self,
+        node: &Node<Entity<Pane>>,
+        claimed: &mut HashSet<String>,
+        cx: &App,
+    ) -> SavedNode {
+        match node {
+            Node::Leaf(pane) => {
+                let pane = pane.read(cx);
+                let tabs = pane
+                    .items()
+                    .iter()
+                    .map(|item| match item {
+                        PaneItem::Terminal(terminal) => {
+                            let terminal = terminal.read(cx);
+                            SavedTab::Terminal {
+                                cwd: terminal.cwd(),
+                                chat: self.chat_in(terminal, claimed, cx),
+                            }
+                        }
+                        PaneItem::File(file) => SavedTab::File {
+                            path: file.read(cx).path().to_path_buf(),
+                        },
+                    })
+                    .collect();
+                SavedNode::Pane {
+                    tabs,
+                    active: pane.active_index(),
+                }
+            }
+            Node::Split {
+                axis,
+                children,
+                sizes,
+                ..
+            } => SavedNode::Split {
+                axis: match axis {
+                    Axis::Horizontal => SavedAxis::Horizontal,
+                    Axis::Vertical => SavedAxis::Vertical,
+                },
+                sizes: sizes.clone(),
+                children: children
+                    .iter()
+                    .map(|child| self.snapshot_node(child, claimed, cx))
+                    .collect(),
+            },
+        }
+    }
+
+    /// The chat running in a terminal, so it can be resumed later.
+    fn chat_in(
+        &self,
+        terminal: &TerminalView,
+        claimed: &mut HashSet<String>,
+        cx: &App,
+    ) -> Option<SavedChat> {
+        let agent = terminal.agent?;
+        if let Some(id) = &terminal.session_id {
+            return Some(SavedChat {
+                agent,
+                id: id.clone(),
+                title: terminal
+                    .chat_title()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| terminal.title()),
+            });
+        }
+        // Started fresh rather than resumed: find the chat it created.
+        let chat = self.sessions.read(cx).infer_chat(
+            agent,
+            &terminal.cwd(),
+            terminal.agent_started_secs()?,
+            claimed,
+        )?;
+        claimed.insert(chat.id.clone());
+        Some(chat)
+    }
+
+    fn save_layout(&mut self, cx: &mut Context<Self>) {
+        let layout = self.snapshot(cx);
+        if cx.global::<Store>().layout_for(&self.root).as_ref() != Some(&layout) {
+            let root = self.root.clone();
+            cx.update_global::<Store, _>(|store, _| store.save_layout(&root, layout));
+        }
+    }
+
+    /// The user is closing this workspace's window.
+    fn window_closing(&mut self, cx: &mut Context<Self>) {
+        self.save_layout(cx);
+        let root = self.root.clone();
+        cx.update_global::<Store, _>(|store, _| store.workspace_closed(&root));
+    }
+
+    /// Rebuilds panes, tabs and sidebar from a remembered layout. Terminals
+    /// start fresh shells in their old folders; chats are resumed.
+    fn restore(&mut self, layout: SavedLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_width = px(layout.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX));
+        self.sidebar_visible = layout.sidebar_visible;
+        self.collapsed = layout.collapsed;
+        self.center = self.restore_node(&layout.tree, window, cx);
+
+        let panes = self.panes();
+        let active = panes
+            .get(layout.active_pane)
+            .or_else(|| panes.first())
+            .cloned()
+            .expect("a layout always has a pane");
+        self.active_pane = active.clone();
+        active.update(cx, |pane, cx| pane.set_active(true, cx));
+        // A workspace with nothing in it would be a dead end.
+        if panes.iter().all(|pane| pane.read(cx).is_empty()) {
+            self.spawn_terminal(&active, None, window, cx);
+        }
+        self.sync_open_sessions(cx);
+        active.read(cx).focus_active(window, cx);
+    }
+
+    fn restore_node(
+        &mut self,
+        node: &SavedNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Node<Entity<Pane>> {
+        match node {
+            SavedNode::Pane { tabs, active } => {
+                let pane = self.create_pane(window, cx);
+                for tab in tabs {
+                    match tab {
+                        SavedTab::Terminal { cwd, chat } => {
+                            let options = SpawnOptions {
+                                cwd: cwd.clone(),
+                                command: chat
+                                    .as_ref()
+                                    .map(|chat| sessions::resume_command(chat.agent, &chat.id)),
+                                label: chat.as_ref().map(|chat| chat.title.clone()),
+                                agent: chat.as_ref().map(|chat| chat.agent),
+                                session_id: chat.as_ref().map(|chat| chat.id.clone()),
+                                workspace_root: self.root.clone(),
+                            };
+                            self.spawn_terminal(&pane, Some(options), window, cx);
+                        }
+                        SavedTab::File { path } => {
+                            if path.is_file() {
+                                let root = self.root.clone();
+                                let view =
+                                    cx.new(|cx| FileView::new(path.clone(), &root, None, cx));
+                                pane.update(cx, |pane, cx| {
+                                    pane.add_item(PaneItem::File(view), window, cx)
+                                });
+                            }
+                        }
+                    }
+                }
+                let active = *active;
+                pane.update(cx, |pane, cx| {
+                    if active < pane.items().len() {
+                        pane.activate(active, window, cx);
+                    }
+                });
+                Node::Leaf(pane)
+            }
+            SavedNode::Split {
+                axis,
+                sizes,
+                children,
+            } => {
+                let mut restored: Vec<Node<Entity<Pane>>> = children
+                    .iter()
+                    .map(|child| self.restore_node(child, window, cx))
+                    .collect();
+                match restored.len() {
+                    0 => Node::Leaf(self.create_pane(window, cx)),
+                    1 => restored.remove(0),
+                    count => {
+                        // Trust the saved sizes only if they are sane.
+                        let total: f32 = sizes.iter().sum();
+                        let usable = sizes.len() == count
+                            && sizes.iter().all(|size| size.is_finite() && *size > 0.01)
+                            && total > 0.;
+                        let sizes = if usable {
+                            sizes.iter().map(|size| size / total).collect()
+                        } else {
+                            vec![1. / count as f32; count]
+                        };
+                        self.next_split_id += 1;
+                        Node::Split {
+                            id: self.next_split_id,
+                            axis: match axis {
+                                SavedAxis::Horizontal => Axis::Horizontal,
+                                SavedAxis::Vertical => Axis::Vertical,
+                            },
+                            children: restored,
+                            sizes,
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn observe_pane(pane: &Entity<Pane>, window: &mut Window, cx: &mut Context<Self>) {
@@ -207,6 +460,10 @@ impl Workspace {
 
     /// Refreshes process names, activity dots and on-disk file changes.
     fn tick(&mut self, cx: &mut Context<Self>) {
+        self.ticks += 1;
+        if self.ticks % SAVE_EVERY == 0 {
+            self.save_layout(cx);
+        }
         let mut any_changed = false;
         for pane in self.panes() {
             let (items, active) = {
@@ -679,20 +936,7 @@ impl Workspace {
 
     // ---- workspace folder ---------------------------------------------------
 
-    fn set_root(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if root == self.root {
-            return;
-        }
-        self.root = root.clone();
-        self.file_tree
-            .update(cx, |tree, cx| tree.set_root(root.clone(), cx));
-        self.sessions
-            .update(cx, |sessions, cx| sessions.set_root(root.clone(), cx));
-        window.set_window_title(&window_title(&root));
-        state::save_root(&root);
-        cx.notify();
-    }
-
+    /// Asks for a folder and opens it as a workspace in its own window.
     fn open_folder(&mut self, _: &OpenFolder, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -700,10 +944,10 @@ impl Workspace {
             multiple: false,
             prompt: Some("Open".into()),
         });
-        cx.spawn_in(window, async move |this, cx| {
+        cx.spawn_in(window, async move |_, cx| {
             if let Ok(Ok(Some(paths))) = paths.await {
                 if let Some(path) = paths.into_iter().next() {
-                    let _ = this.update_in(cx, |this, window, cx| this.set_root(path, window, cx));
+                    let _ = cx.update(|_, cx| windows::open_workspace_window(&path, cx));
                 }
             }
         })
@@ -1043,10 +1287,11 @@ impl Workspace {
                     .cursor_pointer()
                     .hover(|style| style.text_color(theme::text()))
                     .child(root_path)
-                    .on_click(cx.listener(|this, _, window, cx| {
+                    // The workspace name leads back to the home view.
+                    .on_click(|_, _, cx| {
                         cx.stop_propagation();
-                        this.open_folder(&OpenFolder, window, cx);
-                    })),
+                        cx.defer(windows::open_home_window);
+                    }),
             )
             .child(div().flex_1())
             .child(
@@ -1075,6 +1320,7 @@ impl Workspace {
                     this.new_terminal(&NewTerminal, window, cx);
                 })),
             )
+            .child(self.theme_picker.clone())
     }
 
     fn render_divider(
@@ -1326,18 +1572,4 @@ fn window_title(root: &Path) -> String {
         Some(name) => format!("{} — Nexus", name.to_string_lossy()),
         None => "Nexus".to_string(),
     }
-}
-
-/// Abbreviates the home directory as `~`.
-fn display_path(path: &Path) -> String {
-    if let Some(home) = links::home_dir() {
-        if let Ok(rest) = path.strip_prefix(&home) {
-            return if rest.as_os_str().is_empty() {
-                "~".to_string()
-            } else {
-                format!("~/{}", rest.to_string_lossy())
-            };
-        }
-    }
-    path.to_string_lossy().into_owned()
 }

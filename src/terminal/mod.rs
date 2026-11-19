@@ -143,6 +143,7 @@ pub struct TerminalView {
     /// What this tab was launched to run, until that agent shows up.
     launch_agent: Option<Agent>,
     agent_seen: bool,
+    agent_since: Option<u64>,
     spawned_at: Instant,
     pub session_id: Option<String>,
     initial_cwd: PathBuf,
@@ -325,6 +326,7 @@ impl TerminalView {
                 agent: options.agent,
                 launch_agent: options.agent,
                 agent_seen: false,
+                agent_since: None,
                 spawned_at: now,
                 session_id: options.session_id,
                 initial_cwd: cwd,
@@ -426,6 +428,9 @@ impl TerminalView {
             match proc::detect_agent(&name, pid) {
                 Some(agent) => {
                     self.agent = Some(agent);
+                    if !self.agent_seen {
+                        self.agent_since = Some(crate::sessions::now_secs());
+                    }
                     self.agent_seen = true;
                 }
                 None if self.agent_seen => self.agent_finished(),
@@ -455,8 +460,19 @@ impl TerminalView {
         self.agent = None;
         self.launch_agent = None;
         self.agent_seen = false;
+        self.agent_since = None;
         self.label = None;
         self.session_id = None;
+    }
+
+    /// The name of the chat resumed here, if any.
+    pub fn chat_title(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    /// When the agent CLI running here was first seen, in Unix seconds.
+    pub fn agent_started_secs(&self) -> Option<u64> {
+        self.agent_since
     }
 
     /// Recomputes the activity indicator. `in_view` is true while the user is
@@ -1028,7 +1044,7 @@ impl Render for TerminalView {
         div()
             .id(("terminal", self.id))
             .size_full()
-            .bg(gpui::rgb(theme::TERM_BG))
+            .bg(gpui::rgb(theme::term_bg()))
             .track_focus(&self.focus_handle)
             .key_context("Terminal")
             .on_key_down(cx.listener(Self::on_key_down))

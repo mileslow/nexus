@@ -97,6 +97,8 @@ pub struct FileView {
     git_watch: Option<PathBuf>,
     git_stamp: Option<SystemTime>,
     checking: bool,
+    /// The theme the current highlights were computed for.
+    highlight_theme: usize,
     cancel_highlight: Arc<AtomicBool>,
     _load: Option<Task<()>>,
     _highlight: Option<Task<()>>,
@@ -119,11 +121,21 @@ fn syntaxes() -> &'static SyntaxSet {
     SET.get_or_init(two_face::syntax::extra_newlines)
 }
 
+/// The syntect theme that goes with the active color theme.
 fn syntax_theme() -> &'static Theme {
+    use two_face::theme::EmbeddedThemeName as Name;
     static THEMES: OnceLock<two_face::theme::EmbeddedLazyThemeSet> = OnceLock::new();
     THEMES
         .get_or_init(two_face::theme::extra)
-        .get(two_face::theme::EmbeddedThemeName::OneHalfDark)
+        .get(match theme::active().syntax {
+            theme::Syntax::OneHalfDark => Name::OneHalfDark,
+            theme::Syntax::TwoDark => Name::TwoDark,
+            theme::Syntax::CatppuccinMocha => Name::CatppuccinMocha,
+            theme::Syntax::GruvboxDark => Name::GruvboxDark,
+            theme::Syntax::Nord => Name::Nord,
+            theme::Syntax::Github => Name::Github,
+            theme::Syntax::CatppuccinLatte => Name::CatppuccinLatte,
+        })
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
@@ -317,8 +329,15 @@ fn highlight_lines(
         return;
     }
 
-    let mut highlighter = HighlightLines::new(syntax, syntax_theme());
-    let default_color = theme::text();
+    let syntax_theme = syntax_theme();
+    let mut highlighter = HighlightLines::new(syntax, syntax_theme);
+    // Text in the syntax theme's plain color takes the UI text color instead.
+    let default_color = syntax_theme.settings.foreground.map(|color| Rgba {
+        r: color.r as f32 / 255.,
+        g: color.g as f32 / 255.,
+        b: color.b as f32 / 255.,
+        a: 1.,
+    });
     let mut buffer = String::new();
     let limit = lines.len().min(MAX_HIGHLIGHT_LINES);
     let mut start = 0;
@@ -344,7 +363,7 @@ fn highlight_lines(
                         b: style.foreground.b as f32 / 255.,
                         a: 1.,
                     };
-                    if span_end > offset && color != default_color {
+                    if span_end > offset && Some(color) != default_color {
                         let color: Hsla = color.into();
                         match spans.last_mut() {
                             Some((range, last)) if range.end == offset && *last == color => {
@@ -384,6 +403,7 @@ impl FileView {
             git_watch: None,
             git_stamp: None,
             checking: false,
+            highlight_theme: theme::active_index(),
             cancel_highlight: Arc::new(AtomicBool::new(false)),
             _load: None,
             _highlight: None,
@@ -545,8 +565,10 @@ impl FileView {
     }
 
     fn start_highlighting(&mut self, lines: Lines, cx: &mut Context<Self>) {
+        self.cancel_highlight.store(true, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel_highlight = cancel.clone();
+        self.highlight_theme = theme::active_index();
         let path = self.path.clone();
         let (tx, mut rx) = unbounded::<(usize, Vec<LineHighlights>)>();
         let worker_lines = lines.clone();
@@ -823,6 +845,16 @@ impl FileView {
 
 impl Render for FileView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Syntax colors belong to the theme they were computed for.
+        if self.highlight_theme != theme::active_index() {
+            if let Content::Text(text) = &mut self.content {
+                text.highlights = vec![None; text.lines.len()];
+                let lines = text.lines.clone();
+                self.start_highlighting(lines, cx);
+            } else {
+                self.highlight_theme = theme::active_index();
+            }
+        }
         let body = match &self.content {
             Content::Loading => div().into_any_element(),
             Content::Message(message) => div()

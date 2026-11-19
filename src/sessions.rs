@@ -52,10 +52,7 @@ pub struct Session {
 impl Session {
     /// The shell command that reopens this conversation.
     pub fn resume_command(&self) -> String {
-        match self.agent {
-            Agent::Claude => format!("claude --resume {}", shell_quote(&self.id)),
-            Agent::Codex => format!("codex resume {}", shell_quote(&self.id)),
-        }
+        resume_command(self.agent, &self.id)
     }
 
     pub fn project_name(&self) -> &str {
@@ -75,6 +72,14 @@ impl Session {
             self.agent.label().to_lowercase()
         );
         self
+    }
+}
+
+/// The shell command that reopens a conversation.
+pub fn resume_command(agent: Agent, id: &str) -> String {
+    match agent {
+        Agent::Claude => format!("claude --resume {}", shell_quote(id)),
+        Agent::Codex => format!("codex resume {}", shell_quote(id)),
     }
 }
 

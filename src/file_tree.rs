@@ -148,22 +148,6 @@ impl FileTree {
         this
     }
 
-    pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        if root == self.root {
-            return;
-        }
-        self.root = root.clone();
-        self.children.clear();
-        self.mtimes.clear();
-        self.expanded.clear();
-        self.loading.clear();
-        self.rows.clear();
-        self.selected = None;
-        self.expanded.insert(root.clone());
-        self.load_dir(root, cx);
-        cx.notify();
-    }
-
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let dirs: Vec<PathBuf> = self
             .watched_dirs()
