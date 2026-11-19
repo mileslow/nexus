@@ -4,12 +4,13 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, Axis, Context, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, MouseButton, SharedString, Subscription, Window,
+    div, prelude::*, px, AnyElement, App, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, MouseButton, Pixels, Point, SharedString, Subscription, Window,
 };
 
 use crate::assets::icon;
 use crate::file_view::FileView;
+use crate::layout::Direction;
 use crate::links::LinkTarget;
 use crate::sessions::Agent;
 use crate::terminal::{Status, TerminalEvent, TerminalView};
@@ -60,8 +61,13 @@ pub enum PaneEvent {
     Changed,
     /// A link was Cmd-clicked in one of this pane's terminals.
     Open(LinkTarget),
-    Split(Axis),
+    Split(Direction),
     NewTerminal,
+    /// A terminal in this pane was right-clicked.
+    ContextMenu {
+        position: Point<Pixels>,
+        item: EntityId,
+    },
 }
 
 pub struct Pane {
@@ -200,6 +206,10 @@ impl Pane {
                         cx.notify();
                     }
                     TerminalEvent::Open(target) => cx.emit(PaneEvent::Open(target.clone())),
+                    TerminalEvent::ContextMenu(position) => cx.emit(PaneEvent::ContextMenu {
+                        position: *position,
+                        item: terminal.entity_id(),
+                    }),
                 },
             );
             self.subscriptions
@@ -395,10 +405,10 @@ impl Pane {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::NewTerminal))),
                     )
                     .child(icon_button("split-right", "split-right").on_click(
-                        cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Split(Axis::Horizontal))),
+                        cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Split(Direction::Right))),
                     ))
                     .child(icon_button("split-down", "split-down").on_click(
-                        cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Split(Axis::Vertical))),
+                        cx.listener(|_, _, _, cx| cx.emit(PaneEvent::Split(Direction::Down))),
                     )),
             )
     }

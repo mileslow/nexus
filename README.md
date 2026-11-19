@@ -59,6 +59,7 @@ The `claude` and `codex` commands must be on the `PATH` of your login shell.
 | `⌘B` | Toggle the sidebar |
 | `⌘O` | Open a folder |
 | `⌘`-click | Open the path or URL under the pointer |
+| Right-click a terminal | Split up / right / down / left, or close it |
 | `⌘C` / `⌘V` / `⌘K` | Copy selection / paste / clear the terminal |
 | `⇧PageUp` / `⇧PageDown` | Scroll back through terminal history |
 | `⇧Enter` | Insert a newline in an agent prompt |

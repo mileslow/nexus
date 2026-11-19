@@ -101,6 +101,8 @@ pub enum TerminalEvent {
     TitleChanged,
     Closed,
     Open(LinkTarget),
+    /// Right-clicked at this window position.
+    ContextMenu(Point<Pixels>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1035,6 +1037,13 @@ impl Render for TerminalView {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::clear))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    window.focus(&this.focus_handle);
+                    cx.emit(TerminalEvent::ContextMenu(event.position));
+                }),
+            )
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

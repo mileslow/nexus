@@ -6,6 +6,29 @@ use gpui::Axis;
 /// Smallest share of a split one child may be dragged down to.
 const MIN_FRACTION: f32 = 0.08;
 
+/// Where a new pane goes relative to the one being split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Up,
+    Right,
+    Down,
+    Left,
+}
+
+impl Direction {
+    pub fn axis(self) -> Axis {
+        match self {
+            Direction::Left | Direction::Right => Axis::Horizontal,
+            Direction::Up | Direction::Down => Axis::Vertical,
+        }
+    }
+
+    /// Whether the new pane comes before the existing one in layout order.
+    fn before(self) -> bool {
+        matches!(self, Direction::Up | Direction::Left)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node<T> {
     Leaf(T),
@@ -44,19 +67,26 @@ impl<T: Clone + PartialEq> Node<T> {
         matches!(self, Node::Leaf(leaf) if leaf == target)
     }
 
-    /// Places `new` next to `target` along `axis`, halving the target's space.
-    pub fn split(&mut self, target: &T, new: T, axis: Axis, next_id: &mut usize) -> bool {
+    /// Places `new` beside `target` on the given side, halving the target's
+    /// space.
+    pub fn split(&mut self, target: &T, new: T, direction: Direction, next_id: &mut usize) -> bool {
+        let axis = direction.axis();
         match self {
             Node::Leaf(leaf) => {
                 if leaf != target {
                     return false;
                 }
                 let old = Node::Leaf(leaf.clone());
+                let new = Node::Leaf(new);
                 *next_id += 1;
                 *self = Node::Split {
                     id: *next_id,
                     axis,
-                    children: vec![old, Node::Leaf(new)],
+                    children: if direction.before() {
+                        vec![new, old]
+                    } else {
+                        vec![old, new]
+                    },
                     sizes: vec![0.5, 0.5],
                 };
                 true
@@ -72,13 +102,14 @@ impl<T: Clone + PartialEq> Node<T> {
                         let half = sizes[index] / 2.;
                         sizes[index] = half;
                         sizes.insert(index + 1, half);
-                        children.insert(index + 1, Node::Leaf(new));
+                        let at = if direction.before() { index } else { index + 1 };
+                        children.insert(at, Node::Leaf(new));
                         return true;
                     }
                 }
                 for child in children.iter_mut() {
                     if child.contains(target) {
-                        return child.split(target, new, axis, next_id);
+                        return child.split(target, new, direction, next_id);
                     }
                 }
                 false
@@ -161,8 +192,8 @@ mod tests {
     fn splitting_same_axis_adds_a_sibling() {
         let mut next_id = 0;
         let mut tree = Node::Leaf(1);
-        assert!(tree.split(&1, 2, Axis::Horizontal, &mut next_id));
-        assert!(tree.split(&1, 3, Axis::Horizontal, &mut next_id));
+        assert!(tree.split(&1, 2, Direction::Right, &mut next_id));
+        assert!(tree.split(&1, 3, Direction::Right, &mut next_id));
         assert_eq!(tree.leaves(), vec![1, 3, 2]);
         assert_eq!(sizes(&tree), vec![0.25, 0.25, 0.5]);
     }
@@ -171,8 +202,8 @@ mod tests {
     fn splitting_cross_axis_nests() {
         let mut next_id = 0;
         let mut tree = Node::Leaf(1);
-        tree.split(&1, 2, Axis::Horizontal, &mut next_id);
-        assert!(tree.split(&2, 3, Axis::Vertical, &mut next_id));
+        tree.split(&1, 2, Direction::Right, &mut next_id);
+        assert!(tree.split(&2, 3, Direction::Down, &mut next_id));
         assert_eq!(tree.leaves(), vec![1, 2, 3]);
         let Node::Split { children, .. } = &tree else {
             panic!()
@@ -184,15 +215,32 @@ mod tests {
                 ..
             }
         ));
-        assert!(!tree.split(&9, 4, Axis::Vertical, &mut next_id));
+        assert!(!tree.split(&9, 4, Direction::Down, &mut next_id));
+    }
+
+    #[test]
+    fn splitting_left_or_up_puts_the_new_pane_first() {
+        let mut next_id = 0;
+        let mut tree = Node::Leaf(1);
+        assert!(tree.split(&1, 2, Direction::Left, &mut next_id));
+        assert_eq!(tree.leaves(), vec![2, 1]);
+        // Same axis: the new pane lands just before its target.
+        assert!(tree.split(&1, 3, Direction::Left, &mut next_id));
+        assert_eq!(tree.leaves(), vec![2, 3, 1]);
+        assert_eq!(sizes(&tree), vec![0.5, 0.25, 0.25]);
+        // Cross axis: nests, with the new pane on top.
+        assert!(tree.split(&3, 4, Direction::Up, &mut next_id));
+        assert_eq!(tree.leaves(), vec![2, 4, 3, 1]);
+        assert_eq!(Direction::Up.axis(), Axis::Vertical);
+        assert_eq!(Direction::Right.axis(), Axis::Horizontal);
     }
 
     #[test]
     fn removing_collapses_and_redistributes() {
         let mut next_id = 0;
         let mut tree = Node::Leaf(1);
-        tree.split(&1, 2, Axis::Horizontal, &mut next_id);
-        tree.split(&2, 3, Axis::Vertical, &mut next_id);
+        tree.split(&1, 2, Direction::Right, &mut next_id);
+        tree.split(&2, 3, Direction::Down, &mut next_id);
         assert!(tree.remove(&3));
         assert_eq!(tree.leaves(), vec![1, 2]);
         assert!(tree.remove(&1));
@@ -200,8 +248,8 @@ mod tests {
         assert!(!tree.remove(&2), "the last pane stays");
 
         let mut tree = Node::Leaf(1);
-        tree.split(&1, 2, Axis::Horizontal, &mut next_id);
-        tree.split(&1, 3, Axis::Horizontal, &mut next_id);
+        tree.split(&1, 2, Direction::Right, &mut next_id);
+        tree.split(&1, 3, Direction::Right, &mut next_id);
         tree.remove(&2);
         assert_eq!(sizes(&tree), vec![0.5, 0.5]);
     }
@@ -210,8 +258,8 @@ mod tests {
     fn resizing_moves_one_boundary_within_limits() {
         let mut next_id = 0;
         let mut tree = Node::Leaf(1);
-        tree.split(&1, 2, Axis::Horizontal, &mut next_id);
-        tree.split(&2, 3, Axis::Horizontal, &mut next_id);
+        tree.split(&1, 2, Direction::Right, &mut next_id);
+        tree.split(&2, 3, Direction::Right, &mut next_id);
         // sizes: [0.5, 0.25, 0.25]
         assert!(tree.resize(1, 1, 0.6));
         let after = sizes(&tree);

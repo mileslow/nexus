@@ -6,15 +6,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
-    actions, div, prelude::*, px, relative, AnyElement, App, Axis, Context, DragMoveEvent,
-    EmptyView, Entity, FocusHandle, Focusable, FontWeight, PathPromptOptions, Pixels, SharedString,
-    Task, WeakEntity, Window,
+    actions, anchored, deferred, div, prelude::*, px, relative, AnyElement, App, Axis, Context,
+    DragMoveEvent, EmptyView, Entity, EntityId, FocusHandle, Focusable, FontWeight, KeyDownEvent,
+    MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, Task, WeakEntity,
+    Window,
 };
 
 use crate::assets::icon;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::file_view::FileView;
-use crate::layout::Node;
+use crate::layout::{Direction, Node};
 use crate::links::{self, LinkTarget};
 use crate::pane::{icon_button, status_color, terminal_glyph, Pane, PaneEvent, PaneItem};
 use crate::session_list::{SessionList, SessionListEvent};
@@ -60,6 +61,12 @@ const SECTION_TERMINALS: usize = 0;
 const SECTION_FILES: usize = 1;
 const SECTION_CHATS: usize = 2;
 
+#[derive(Clone, Copy)]
+enum MenuChoice {
+    Split(Direction),
+    Close,
+}
+
 /// Drag payload for the divider between two panes.
 struct SplitDrag {
     split_id: usize,
@@ -83,7 +90,15 @@ pub struct Workspace {
     collapsed: [bool; 3],
     next_split_id: usize,
     window_active: bool,
+    /// The right-click menu for a terminal, while it is open.
+    terminal_menu: Option<TerminalMenu>,
     _tick: Task<()>,
+}
+
+struct TerminalMenu {
+    position: Point<Pixels>,
+    pane: Entity<Pane>,
+    terminal: EntityId,
 }
 
 impl Focusable for Workspace {
@@ -158,6 +173,7 @@ impl Workspace {
             collapsed: [false; 3],
             next_split_id: 0,
             window_active: true,
+            terminal_menu: None,
             _tick: tick,
         };
         this.spawn_terminal(&pane, None, window, cx);
@@ -370,7 +386,7 @@ impl Workspace {
         self.center.split(
             &base,
             pane.clone(),
-            Axis::Horizontal,
+            Direction::Right,
             &mut self.next_split_id,
         );
         pane
@@ -456,7 +472,10 @@ impl Workspace {
                 cx.notify();
             }
             PaneEvent::Open(target) => self.open_link(target, pane, window, cx),
-            PaneEvent::Split(axis) => self.split_pane(pane, *axis, window, cx),
+            PaneEvent::Split(direction) => self.split_pane(pane, *direction, window, cx),
+            PaneEvent::ContextMenu { position, item } => {
+                self.open_terminal_menu(*position, pane.clone(), *item, cx)
+            }
             PaneEvent::NewTerminal => self.spawn_terminal(pane, None, window, cx),
         }
     }
@@ -471,10 +490,11 @@ impl Workspace {
         }
     }
 
+    /// Opens a new terminal pane beside `pane`, on the given side.
     fn split_pane(
         &mut self,
         pane: &Entity<Pane>,
-        axis: Axis,
+        direction: Direction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -482,7 +502,7 @@ impl Workspace {
         let new_pane = self.create_pane(window, cx);
         if !self
             .center
-            .split(pane, new_pane.clone(), axis, &mut self.next_split_id)
+            .split(pane, new_pane.clone(), direction, &mut self.next_split_id)
         {
             return;
         }
@@ -497,6 +517,128 @@ impl Workspace {
         self.spawn_terminal(&new_pane, Some(options), window, cx);
         self.set_active_pane(&new_pane, cx);
         cx.notify();
+    }
+
+    // ---- terminal right-click menu ------------------------------------------
+
+    fn open_terminal_menu(
+        &mut self,
+        position: Point<Pixels>,
+        pane: Entity<Pane>,
+        terminal: EntityId,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_menu = Some(TerminalMenu {
+            position,
+            pane,
+            terminal,
+        });
+        cx.notify();
+    }
+
+    fn dismiss_terminal_menu(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Runs a menu choice against the terminal the menu was opened on.
+    fn choose_from_terminal_menu(
+        &mut self,
+        choice: MenuChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.terminal_menu.take() else {
+            return;
+        };
+        cx.notify();
+        // The pane may have been closed while the menu was open.
+        if !self.center.contains(&menu.pane) {
+            return;
+        }
+        match choice {
+            MenuChoice::Split(direction) => self.split_pane(&menu.pane, direction, window, cx),
+            MenuChoice::Close => menu.pane.update(cx, |pane, cx| {
+                if let Some(index) = pane.index_of(menu.terminal) {
+                    pane.close_item(index, window, cx);
+                }
+            }),
+        }
+    }
+
+    fn render_terminal_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let menu = self.terminal_menu.as_ref()?;
+        let row =
+            |id: &'static str, glyph: &'static str, label: &'static str, choice: MenuChoice| {
+                div()
+                    .id(id)
+                    .h(px(26.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .rounded(px(5.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::bg_active()))
+                    .child(icon(glyph, px(13.), theme::text_muted()))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.choose_from_terminal_menu(choice, window, cx)
+                    }))
+            };
+        Some(
+            deferred(
+                anchored()
+                    .position(menu.position)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .id("terminal-menu")
+                            .occlude()
+                            .w(px(168.))
+                            .p(px(4.))
+                            .flex()
+                            .flex_col()
+                            .bg(theme::bg_sidebar())
+                            .border_1()
+                            .border_color(theme::border_strong())
+                            .rounded(px(8.))
+                            .shadow_lg()
+                            .text_color(theme::text())
+                            .on_mouse_down_out(
+                                cx.listener(|this, _, _, cx| this.dismiss_terminal_menu(cx)),
+                            )
+                            .child(row(
+                                "menu-split-up",
+                                "arrow-up",
+                                "Split Up",
+                                MenuChoice::Split(Direction::Up),
+                            ))
+                            .child(row(
+                                "menu-split-right",
+                                "arrow-right",
+                                "Split Right",
+                                MenuChoice::Split(Direction::Right),
+                            ))
+                            .child(row(
+                                "menu-split-down",
+                                "arrow-down",
+                                "Split Down",
+                                MenuChoice::Split(Direction::Down),
+                            ))
+                            .child(row(
+                                "menu-split-left",
+                                "arrow-left",
+                                "Split Left",
+                                MenuChoice::Split(Direction::Left),
+                            ))
+                            .child(div().h(px(1.)).my(px(4.)).mx(px(4.)).bg(theme::border()))
+                            .child(row("menu-close", "close", "Close", MenuChoice::Close)),
+                    ),
+            )
+            .with_priority(1),
+        )
     }
 
     fn remove_pane(&mut self, pane: &Entity<Pane>, window: &mut Window, cx: &mut Context<Self>) {
@@ -641,6 +783,8 @@ impl Workspace {
                 let status = status_color(terminal.status());
                 let activate_pane = pane.clone();
                 let close_pane = pane.clone();
+                let menu_pane = pane.clone();
+                let terminal_id = item.entity_id();
 
                 rows.push(
                     div()
@@ -701,6 +845,17 @@ impl Workspace {
                                 }),
                         )
                         .relative()
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.open_terminal_menu(
+                                    event.position,
+                                    menu_pane.clone(),
+                                    terminal_id,
+                                    cx,
+                                )
+                            }),
+                        )
                         .on_click(move |_, window, cx| {
                             activate_pane.update(cx, |pane, cx| pane.activate(index, window, cx));
                         })
@@ -1036,12 +1191,12 @@ impl Workspace {
 
     fn split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.active_pane.clone();
-        self.split_pane(&pane, Axis::Horizontal, window, cx);
+        self.split_pane(&pane, Direction::Right, window, cx);
     }
 
     fn split_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.active_pane.clone();
-        self.split_pane(&pane, Axis::Vertical, window, cx);
+        self.split_pane(&pane, Direction::Down, window, cx);
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -1092,6 +1247,15 @@ impl Render for Workspace {
             .font_family(theme::UI_FONT)
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
+            // Any key dismisses the terminal menu; Escape does only that.
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if this.terminal_menu.is_some() {
+                    this.dismiss_terminal_menu(cx);
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                    }
+                }
+            }))
             .on_action(cx.listener(Self::new_terminal))
             .on_action(cx.listener(Self::new_claude))
             .on_action(cx.listener(Self::new_codex))
@@ -1153,6 +1317,7 @@ impl Render for Workspace {
                     })
                     .child(div().flex_1().min_w_0().h_full().child(center)),
             )
+            .children(self.render_terminal_menu(cx))
     }
 }
 

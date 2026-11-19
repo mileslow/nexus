@@ -20,6 +20,22 @@ const ICONS: &[(&str, &str)] = &[
         icon_svg!(r#"<path d="M6 3.5 10.5 8 6 12.5"/>"#),
     ),
     (
+        "arrow-up",
+        icon_svg!(r#"<path d="M8 13V3M3.5 7.500 8 3l4.500 4.500"/>"#),
+    ),
+    (
+        "arrow-down",
+        icon_svg!(r#"<path d="M8 3v10M3.500 8.500 8 13l4.500-4.500"/>"#),
+    ),
+    (
+        "arrow-left",
+        icon_svg!(r#"<path d="M13 8H3M7.500 3.500 3 8l4.500 4.500"/>"#),
+    ),
+    (
+        "arrow-right",
+        icon_svg!(r#"<path d="M3 8h10M8.500 3.500 13 8l-4.500 4.500"/>"#),
+    ),
+    (
         "chevron-up",
         icon_svg!(r#"<path d="M3.5 10 8 5.5 12.5 10"/>"#),
     ),
