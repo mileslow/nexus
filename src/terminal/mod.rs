@@ -31,6 +31,7 @@ use gpui::{
     Size, Task, TouchPhase, Window,
 };
 
+use crate::file_tree::DraggedPath;
 use crate::links::{self, Link, LinkTarget};
 use crate::sessions::{shell_quote, Agent};
 use crate::theme;
@@ -114,6 +115,20 @@ pub enum Status {
     /// Finished a burst of work while out of view.
     Done,
     Idle,
+}
+
+/// What to type when a path is dropped on a terminal. An agent gets an
+/// `@` mention relative to its folder, which attaches the file to the chat;
+/// a shell gets the quoted absolute path.
+pub fn dropped_path_text(path: &std::path::Path, cwd: &std::path::Path, agent: bool) -> String {
+    if agent {
+        let shown = path.strip_prefix(cwd).unwrap_or(path).to_string_lossy();
+        // Mentions end at whitespace, so such paths fall back to quoting.
+        if !shown.is_empty() && !shown.contains(char::is_whitespace) {
+            return format!("@{shown} ");
+        }
+    }
+    format!("{} ", shell_quote(&path.to_string_lossy()))
 }
 
 /// A link under the pointer while Cmd is held.
@@ -475,6 +490,11 @@ impl TerminalView {
         self.agent_since
     }
 
+    /// When this terminal last printed anything, in Unix seconds.
+    pub fn last_output_secs(&self) -> u64 {
+        crate::sessions::now_secs().saturating_sub(self.last_output.elapsed().as_secs())
+    }
+
     /// Recomputes the activity indicator. `in_view` is true while the user is
     /// looking at this terminal. Returns true when the status changed.
     pub fn update_status(&mut self, in_view: bool) -> bool {
@@ -730,6 +750,19 @@ impl TerminalView {
             let bytes = keys::paste_bytes(&format!("{text} "), self.mode());
             self.input(bytes, cx);
         }
+    }
+
+    /// A file or folder dragged in from the sidebar.
+    fn on_drop_dragged_path(
+        &mut self,
+        dragged: &DraggedPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = dropped_path_text(&dragged.path, &self.cwd(), self.agent.is_some());
+        window.focus(&self.focus_handle);
+        let bytes = keys::paste_bytes(&text, self.mode());
+        self.input(bytes, cx);
     }
 
     // ---- mouse --------------------------------------------------------------
@@ -1070,6 +1103,40 @@ impl Render for TerminalView {
                 }
             }))
             .on_drop(cx.listener(Self::on_drop_paths))
+            .on_drop(cx.listener(Self::on_drop_dragged_path))
+            .drag_over::<DraggedPath>(|style, _, _, _| style.bg(theme::bg_hover()))
             .child(element::TerminalElement::new(cx.entity(), focused))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn dropped_paths_become_mentions_for_agents_and_quoted_paths_for_shells() {
+        let cwd = Path::new("/work/app");
+        assert_eq!(
+            dropped_path_text(Path::new("/work/app/src/main.rs"), cwd, true),
+            "@src/main.rs "
+        );
+        // Outside the agent's folder the mention is absolute.
+        assert_eq!(
+            dropped_path_text(Path::new("/etc/hosts"), cwd, true),
+            "@/etc/hosts "
+        );
+        assert_eq!(
+            dropped_path_text(Path::new("/work/app/my notes.md"), cwd, true),
+            "'/work/app/my notes.md' "
+        );
+        assert_eq!(
+            dropped_path_text(Path::new("/work/app/src/main.rs"), cwd, false),
+            "/work/app/src/main.rs "
+        );
+        assert_eq!(
+            dropped_path_text(Path::new("/work/it's here/a.txt"), cwd, false),
+            r"'/work/it'\''s here/a.txt' "
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! The window's root view: title bar, sidebar (terminals, files, chats) and
 //! the tiled panes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -215,13 +215,8 @@ impl Workspace {
 
     /// Describes the current panes, tabs and sidebar so they can be rebuilt.
     fn snapshot(&self, cx: &App) -> SavedLayout {
-        // Chats already tied to a terminal cannot be another terminal's chat.
-        let mut claimed: HashSet<String> = self
-            .terminals(cx)
-            .iter()
-            .filter_map(|(_, _, terminal)| terminal.read(cx).session_id.clone())
-            .collect();
-        let tree = self.snapshot_node(&self.center, &mut claimed, cx);
+        let chats = self.running_chats(cx);
+        let tree = self.snapshot_node(&self.center, &chats, cx);
         SavedLayout {
             sidebar_width: f32::from(self.sidebar_width),
             sidebar_visible: self.sidebar_visible,
@@ -235,10 +230,62 @@ impl Workspace {
         }
     }
 
+    /// The chat running in each agent terminal, so it can be resumed later.
+    fn running_chats(&self, cx: &App) -> HashMap<EntityId, SavedChat> {
+        let mut chats = HashMap::new();
+        // Chats already tied to a terminal cannot be another terminal's chat.
+        let mut claimed = HashSet::new();
+        let mut unknown = Vec::new();
+        for (_, _, entity) in self.terminals(cx) {
+            let terminal = entity.read(cx);
+            let Some(agent) = terminal.agent else {
+                continue;
+            };
+            match &terminal.session_id {
+                Some(id) => {
+                    claimed.insert(id.clone());
+                    chats.insert(
+                        entity.entity_id(),
+                        SavedChat {
+                            agent,
+                            id: id.clone(),
+                            title: terminal
+                                .chat_title()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| terminal.title()),
+                        },
+                    );
+                }
+                None => {
+                    if let Some(started) = terminal.agent_started_secs() {
+                        unknown.push((
+                            entity.entity_id(),
+                            agent,
+                            terminal.cwd(),
+                            started,
+                            terminal.last_output_secs(),
+                        ));
+                    }
+                }
+            }
+        }
+        // Not resumed by Nexus: work out which chat each one is running,
+        // letting the most recently active terminal choose first.
+        unknown.sort_by(|a, b| b.4.cmp(&a.4));
+        let sessions = self.sessions.read(cx);
+        for (id, agent, cwd, started, last_output) in unknown {
+            if let Some(chat) = sessions.infer_chat(agent, &cwd, started, last_output, &claimed) {
+                claimed.insert(chat.id.clone());
+                chats.insert(id, chat);
+            }
+        }
+        chats
+    }
+
     fn snapshot_node(
         &self,
         node: &Node<Entity<Pane>>,
-        claimed: &mut HashSet<String>,
+        chats: &HashMap<EntityId, SavedChat>,
         cx: &App,
     ) -> SavedNode {
         match node {
@@ -248,13 +295,10 @@ impl Workspace {
                     .items()
                     .iter()
                     .map(|item| match item {
-                        PaneItem::Terminal(terminal) => {
-                            let terminal = terminal.read(cx);
-                            SavedTab::Terminal {
-                                cwd: terminal.cwd(),
-                                chat: self.chat_in(terminal, claimed, cx),
-                            }
-                        }
+                        PaneItem::Terminal(terminal) => SavedTab::Terminal {
+                            cwd: terminal.read(cx).cwd(),
+                            chat: chats.get(&terminal.entity_id()).cloned(),
+                        },
                         PaneItem::File(file) => SavedTab::File {
                             path: file.read(cx).path().to_path_buf(),
                         },
@@ -278,39 +322,10 @@ impl Workspace {
                 sizes: sizes.clone(),
                 children: children
                     .iter()
-                    .map(|child| self.snapshot_node(child, claimed, cx))
+                    .map(|child| self.snapshot_node(child, chats, cx))
                     .collect(),
             },
         }
-    }
-
-    /// The chat running in a terminal, so it can be resumed later.
-    fn chat_in(
-        &self,
-        terminal: &TerminalView,
-        claimed: &mut HashSet<String>,
-        cx: &App,
-    ) -> Option<SavedChat> {
-        let agent = terminal.agent?;
-        if let Some(id) = &terminal.session_id {
-            return Some(SavedChat {
-                agent,
-                id: id.clone(),
-                title: terminal
-                    .chat_title()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| terminal.title()),
-            });
-        }
-        // Started fresh rather than resumed: find the chat it created.
-        let chat = self.sessions.read(cx).infer_chat(
-            agent,
-            &terminal.cwd(),
-            terminal.agent_started_secs()?,
-            claimed,
-        )?;
-        claimed.insert(chat.id.clone());
-        Some(chat)
     }
 
     fn save_layout(&mut self, cx: &mut Context<Self>) {

@@ -30,6 +30,44 @@ pub enum FileTreeEvent {
     OpenFile(PathBuf),
 }
 
+/// A file or folder being dragged out of the tree.
+#[derive(Clone)]
+pub struct DraggedPath {
+    pub path: PathBuf,
+    name: SharedString,
+    is_dir: bool,
+}
+
+/// The chip that follows the pointer while a path is dragged.
+struct PathPreview(DraggedPath);
+
+impl Render for PathPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h(px(26.))
+            .max_w(px(260.))
+            .px(px(9.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(6.))
+            .bg(theme::bg_active())
+            .border_1()
+            .border_color(theme::border_strong())
+            .text_size(theme::UI_TEXT_SIZE)
+            .font_family(theme::UI_FONT)
+            .text_color(theme::text())
+            .shadow_md()
+            .opacity(0.92)
+            .child(icon(
+                if self.0.is_dir { "folder" } else { "file" },
+                px(13.),
+                theme::text_muted(),
+            ))
+            .child(div().min_w_0().truncate().child(self.0.name.clone()))
+    }
+}
+
 #[derive(Clone)]
 struct Child {
     name: SharedString,
@@ -330,6 +368,15 @@ impl FileTree {
             .child(glyph)
             .child(div().flex_1().min_w_0().truncate().child(row.name.clone()))
             .on_click(cx.listener(move |this, _, _, cx| this.click_row(index, cx)))
+            // Drag onto a terminal to type the path there.
+            .on_drag(
+                DraggedPath {
+                    path: row.path.clone(),
+                    name: row.name.clone(),
+                    is_dir: row.is_dir,
+                },
+                |dragged, _, _, cx| cx.new(|_| PathPreview(dragged.clone())),
+            )
     }
 }
 

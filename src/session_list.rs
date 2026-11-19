@@ -85,6 +85,7 @@ pub fn infer_chat(
     agent: Agent,
     cwd: &Path,
     agent_started: u64,
+    last_output: u64,
     claimed: &HashSet<String>,
     created: &dyn Fn(&Path) -> Option<u64>,
 ) -> Option<SavedChat> {
@@ -100,7 +101,14 @@ pub fn infer_chat(
                 && session.modified + SLACK >= agent_started
                 && !claimed.contains(&session.id)
         })
-        .filter(|session| created(&session.path).is_some_and(|at| at + SLACK >= agent_started))
+        .filter(|session| {
+            // A chat the agent started: its log did not exist before.
+            let started_here = created(&session.path).is_some_and(|at| at + SLACK >= agent_started);
+            // A chat picked up from inside the agent: an older log, written
+            // to while this terminal was still producing output.
+            let resumed_here = session.modified <= last_output + SLACK;
+            started_here || resumed_here
+        })
         .max_by_key(|session| session.modified)
         .map(|session| SavedChat {
             agent,
@@ -162,14 +170,19 @@ impl SessionList {
         }
     }
 
-    /// Works out which chat an agent is running when it was not started by
-    /// resuming one: the most recently active chat of that agent, in that
-    /// folder, whose log was created after the agent started.
+    /// Works out which chat an agent is running when Nexus did not start it
+    /// by resuming one. It is the most recently active chat of that agent in
+    /// that folder that was either created after the agent started, or was
+    /// last written to while this terminal was still producing output (a
+    /// chat resumed from inside the agent). Callers ask on behalf of the most
+    /// recently active terminal first, so several agents in one folder pair
+    /// off with their chats in order of activity.
     pub fn infer_chat(
         &self,
         agent: Agent,
         cwd: &Path,
         agent_started: u64,
+        last_output: u64,
         claimed: &HashSet<String>,
     ) -> Option<SavedChat> {
         infer_chat(
@@ -177,6 +190,7 @@ impl SessionList {
             agent,
             cwd,
             agent_started,
+            last_output,
             claimed,
             &|path| {
                 let created = std::fs::metadata(path).ok()?.created().ok()?;
@@ -484,21 +498,21 @@ mod tests {
         }
     }
 
+    fn dated(agent: Agent, title: &str, cwd: &str, modified: u64) -> Session {
+        let mut session = session(agent, title, cwd);
+        session.modified = modified;
+        session.path = format!("/logs/{title}").into();
+        session
+    }
+
     #[test]
     fn infers_the_chat_an_agent_started_itself() {
-        let mut older = session(Agent::Claude, "older chat", "/work/app");
-        older.modified = 500;
-        older.path = "/logs/older".into();
-        let mut current = session(Agent::Claude, "current chat", "/work/app/");
-        current.modified = 900;
-        current.path = "/logs/current".into();
-        let mut elsewhere = session(Agent::Claude, "other folder", "/work/site");
-        elsewhere.modified = 950;
-        elsewhere.path = "/logs/elsewhere".into();
-        let mut codex = session(Agent::Codex, "codex chat", "/work/app");
-        codex.modified = 960;
-        codex.path = "/logs/codex".into();
-        let sessions = vec![older, current, elsewhere, codex];
+        let sessions = vec![
+            dated(Agent::Claude, "older", "/work/app", 500),
+            dated(Agent::Claude, "current", "/work/app/", 900),
+            dated(Agent::Claude, "elsewhere", "/work/site", 950),
+            dated(Agent::Codex, "codex", "/work/app", 960),
+        ];
         // `older` was created long before the agent started at t=800.
         let created = |path: &Path| match path.to_str()? {
             "/logs/older" => Some(100),
@@ -512,16 +526,52 @@ mod tests {
                 Agent::Claude,
                 Path::new("/work/app"),
                 started,
+                // The terminal went quiet before any of these were written.
+                started,
                 &claimed,
                 &created,
             )
             .map(|chat| chat.title)
         };
-        assert_eq!(infer(800, &[]).as_deref(), Some("current chat"));
+        assert_eq!(infer(800, &[]).as_deref(), Some("current"));
         // Already shown in another terminal: not this one's chat.
-        assert_eq!(infer(800, &["current chat"]), None);
+        assert_eq!(infer(800, &["current"]), None);
         // Nothing was created after an agent that started later.
         assert_eq!(infer(2000, &[]), None);
+    }
+
+    #[test]
+    fn infers_chats_resumed_from_inside_the_agent() {
+        // Two old chats, both picked up again by agents started at t=1000.
+        let sessions = vec![
+            dated(Agent::Claude, "first", "/work/app", 1300),
+            dated(Agent::Claude, "second", "/work/app", 1200),
+            dated(Agent::Claude, "stale", "/work/app", 400),
+        ];
+        let created = |_: &Path| Some(100);
+        let infer = |started: u64, last_output: u64, claimed: &[&str]| {
+            let claimed: HashSet<String> = claimed.iter().map(|id| id.to_string()).collect();
+            infer_chat(
+                &sessions,
+                Agent::Claude,
+                Path::new("/work/app"),
+                started,
+                last_output,
+                &claimed,
+                &created,
+            )
+            .map(|chat| chat.title)
+        };
+        // The terminal active most recently takes the chat written most recently...
+        assert_eq!(infer(1000, 1302, &[]).as_deref(), Some("first"));
+        // ...and the next terminal takes the next one.
+        assert_eq!(infer(1000, 1203, &["first"]).as_deref(), Some("second"));
+        // A terminal that went quiet at t=1203 cannot own a chat written at t=1300.
+        assert_eq!(infer(1000, 1203, &[]).as_deref(), Some("second"));
+        // An agent that has printed nothing since it started owns no old chat.
+        assert_eq!(infer(1250, 1251, &[]), None);
+        // Chats untouched since before the agent started are never taken.
+        assert_eq!(infer(1000, 5000, &["first", "second"]), None);
     }
 
     #[test]
