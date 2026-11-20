@@ -27,6 +27,7 @@ use crate::sessions::{self, Agent, Session};
 use crate::terminal::{SpawnOptions, TerminalView};
 use crate::theme;
 use crate::theme_picker::ThemePicker;
+use crate::update::UpdateBadge;
 use crate::windows;
 
 actions!(
@@ -101,6 +102,7 @@ pub struct Workspace {
     /// The right-click menu for a terminal, while it is open.
     terminal_menu: Option<TerminalMenu>,
     theme_picker: Entity<ThemePicker>,
+    update_badge: Entity<UpdateBadge>,
     ticks: usize,
     _tick: Task<()>,
 }
@@ -185,6 +187,7 @@ impl Workspace {
             window_active: true,
             terminal_menu: None,
             theme_picker: cx.new(|_| ThemePicker::new()),
+            update_badge: cx.new(UpdateBadge::new),
             ticks: 0,
             _tick: tick,
         };
@@ -1382,6 +1385,7 @@ impl Workspace {
                     }),
             )
             .child(div().flex_1())
+            .child(self.update_badge.clone())
             .child(
                 self.render_launch_button("launch-claude", "sparkle", theme::claude(), "Claude")
                     .on_click(cx.listener(|this, _, window, cx| {

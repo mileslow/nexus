@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Nexus app icon. Regenerate the .icns with scripts/make-icon.sh. -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#252a52"/>
+      <stop offset="0.55" stop-color="#12142b"/>
+      <stop offset="1" stop-color="#080914"/>
+    </linearGradient>
+    <radialGradient id="glow-cool" cx="250" cy="790" r="560" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow-warm" cx="780" cy="230" r="560" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e879f9" stop-opacity="0.36"/>
+      <stop offset="1" stop-color="#e879f9" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="stroke" x1="312" y1="732" x2="712" y2="292" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#818cf8"/>
+      <stop offset="1" stop-color="#f472b6"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.34"/>
+      <stop offset="0.35" stop-color="#ffffff" stop-opacity="0.04"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.08"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
+      <feOffset dy="12"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.38"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="bloom" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="26"/>
+    </filter>
+    <filter id="halo" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="30"/>
+    </filter>
+    <clipPath id="clip"><rect x="100" y="100" width="824" height="824" rx="186"/></clipPath>
+  </defs>
+
+  <g filter="url(#shadow)">
+    <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#body)"/>
+  </g>
+  <g clip-path="url(#clip)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#glow-cool)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#glow-warm)"/>
+    <!-- Faint pane dividers: the multiplexer behind the mark. -->
+    <g stroke="#ffffff" stroke-opacity="0.055" stroke-width="3">
+      <path d="M512 100V924M100 512H512M512 384H924M512 700H924"/>
+    </g>
+  </g>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="url(#rim)" stroke-width="3"/>
+
+  <!-- The N: four nodes joined by three links. -->
+  <path d="M312 732V292L712 732V292" fill="none" stroke="url(#stroke)" stroke-width="64"
+        stroke-linecap="round" stroke-linejoin="round" filter="url(#bloom)" opacity="0.75"/>
+  <path d="M312 732V292L712 732V292" fill="none" stroke="url(#stroke)" stroke-width="54"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g filter="url(#halo)" opacity="0.9">
+    <circle cx="312" cy="732" r="62" fill="#22d3ee"/>
+    <circle cx="312" cy="292" r="62" fill="#818cf8"/>
+    <circle cx="712" cy="732" r="62" fill="#818cf8"/>
+    <circle cx="712" cy="292" r="62" fill="#f472b6"/>
+  </g>
+  <g fill="#f8faff">
+    <circle cx="312" cy="732" r="50"/>
+    <circle cx="312" cy="292" r="50"/>
+    <circle cx="712" cy="732" r="50"/>
+    <circle cx="712" cy="292" r="50"/>
+  </g>
+  <circle cx="312" cy="732" r="24" fill="#22d3ee"/>
+  <circle cx="312" cy="292" r="24" fill="#818cf8"/>
+  <circle cx="712" cy="732" r="24" fill="#818cf8"/>
+  <circle cx="712" cy="292" r="24" fill="#f472b6"/>
+</svg>

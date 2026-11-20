@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template for Nexus.app; scripts/bundle.sh fills in @VERSION@. -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>Nexus</string>
+    <key>CFBundleDisplayName</key>
+    <string>Nexus</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.mileslow.nexus</string>
+    <key>CFBundleExecutable</key>
+    <string>nexus</string>
+    <key>CFBundleIconFile</key>
+    <string>Nexus</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.developer-tools</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>github.com/mileslow/nexus</string>
+    <!-- Folders can be dropped on the Dock icon or opened with `open -a Nexus`. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Folder</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.folder</string>
+            </array>
+        </dict>
+    </array>
+    <!-- Shown when a program in a terminal first asks for one of these. -->
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>A program running in Nexus wants to use files in your Desktop folder.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>A program running in Nexus wants to use files in your Documents folder.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>A program running in Nexus wants to use files in your Downloads folder.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>A program running in Nexus wants to use files on a removable volume.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>A program running in Nexus wants to use files on a network volume.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>A program running in Nexus wants to control another application.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>A program running in Nexus wants to reach devices on your local network.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>A program running in Nexus wants to use the camera.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>A program running in Nexus wants to use the microphone.</string>
+</dict>
+</plist>

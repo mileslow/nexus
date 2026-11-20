@@ -1,0 +1,31 @@
+#!/bin/sh
+# nexus [folder ...]: opens folders in Nexus, or just brings Nexus forward.
+# Lives inside Nexus.app; install.sh links it onto your PATH.
+set -eu
+
+# Follow symlinks back to the copy inside the app bundle.
+self="$0"
+while [ -L "$self" ]; do
+    target="$(readlink "$self")"
+    case "$target" in
+        /*) self="$target" ;;
+        *) self="$(dirname "$self")/$target" ;;
+    esac
+done
+app="$(cd "$(dirname "$self")/../../.." && pwd)"
+
+case "${1:-}" in
+    -h | --help)
+        echo "usage: nexus [folder ...]"
+        exit 0
+        ;;
+    -v | --version)
+        /usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$app/Contents/Info.plist"
+        exit 0
+        ;;
+esac
+
+if [ "$#" -eq 0 ]; then
+    exec /usr/bin/open -a "$app"
+fi
+exec /usr/bin/open -a "$app" "$@"

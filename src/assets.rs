@@ -150,3 +150,13 @@ pub fn icon(name: &'static str, size: Pixels, color: impl Into<Hsla>) -> Svg {
         .flex_none()
         .text_color(color.into())
 }
+
+/// The app icon, for drawing inside the app.
+pub fn logo() -> std::sync::Arc<gpui::Image> {
+    static LOGO: std::sync::OnceLock<std::sync::Arc<gpui::Image>> = std::sync::OnceLock::new();
+    LOGO.get_or_init(|| {
+        let bytes = include_bytes!("../assets/icon.png").to_vec();
+        std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))
+    })
+    .clone()
+}

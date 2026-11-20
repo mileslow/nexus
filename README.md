@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon.png" width="128" height="128" alt="Nexus icon"></p>
+
 # Nexus
 
 A fast agent multiplexer / IDE for macOS, built with Rust and [GPUI](https://gpui.rs).
@@ -48,18 +50,59 @@ searchable list.
   Night Owl, Dracula, One Dark and both Solarized variants, switched from the
   palette button in the title bar and applied to every window at once.
 
-## Run
+## Install
 
 ```sh
-cargo run --release              # reopen last time's windows, or the home view
-cargo run --release -- ~/code/app   # open a folder as a workspace
+curl -fsSL https://raw.githubusercontent.com/mileslow/nexus/main/install.sh | sh
 ```
 
-Requires macOS. The Rust toolchain is pinned in `rust-toolchain.toml`
-(rustup installs it on first build). Only the Xcode Command Line Tools are
-needed: shaders are compiled at runtime, so full Xcode is not required.
+This puts the latest release in `/Applications` and links a `nexus` command
+onto your `PATH` (`nexus ~/code/app` opens a folder, in the running app if
+there is one). Or download `Nexus.zip` from the
+[latest release](https://github.com/mileslow/nexus/releases/latest) and drag
+`Nexus.app` into Applications yourself.
+
+Releases are not notarized by Apple. The install script is unaffected, but a
+copy downloaded with a browser is blocked the first time you open it: allow it
+under System Settings → Privacy & Security → Open Anyway.
 
 The `claude` and `codex` commands must be on the `PATH` of your login shell.
+
+## Updates
+
+Nexus checks for a newer release shortly after it starts and every six hours
+after that, downloads it in the background, and shows **Restart to update** in
+the title bar once it is ready. Nothing is replaced until you click it; the
+restart brings your windows, layouts and chats back. **Nexus → Check for
+Updates…** checks on demand. Set `NEXUS_NO_UPDATE_CHECK=1` to turn the
+automatic check off.
+
+## Build from source
+
+```sh
+cargo run --release                 # reopen last time's windows, or the home view
+cargo run --release -- ~/code/app   # open a folder as a workspace
+scripts/bundle.sh --install         # build Nexus.app and put it in /Applications
+```
+
+The Rust toolchain is pinned in `rust-toolchain.toml` (rustup installs it on
+first build). Only the Xcode Command Line Tools are needed: shaders are
+compiled at runtime, so full Xcode is not required.
+
+## Publishing a release
+
+```sh
+scripts/release.sh patch    # or minor, major, or an exact version like 0.4.2
+```
+
+That bumps the version in `Cargo.toml`, commits, tags and pushes. The
+[release workflow](.github/workflows/release.yml) then runs the tests, builds
+a universal `Nexus.app`, and publishes `Nexus.zip` and `latest.json` as a
+GitHub release. Installed copies find it on their next update check.
+
+To sign with a Developer ID certificate instead of ad hoc, set
+`NEXUS_SIGN_IDENTITY` when running `scripts/bundle.sh`. The icon is drawn in
+`assets/icon.svg`; `scripts/make-icon.sh` rebuilds `Nexus.icns` from it.
 
 ## Keys
 
@@ -76,6 +119,7 @@ The `claude` and `codex` commands must be on the `PATH` of your login shell.
 | `⌘1`–`⌘9` | Jump to the nth terminal in the sidebar |
 | `⌘P` | Search chats (`↑`/`↓` to move, `Enter` to open, `Esc` to leave) |
 | `⌘B` | Toggle the sidebar |
+| `⌘H` / `⌘M` | Hide Nexus / minimize the window |
 | `⌘`-click | Open the path or URL under the pointer |
 | Right-click a terminal | Split up / right / down / left, or close it |
 | Drag a tab | Reorder it, move it to another pane, or drop on a pane's edge to split |
@@ -102,6 +146,8 @@ onto a terminal pastes their paths.
 | `home.rs`, `windows.rs` | The home view, and opening windows |
 | `app_state.rs` | What is remembered between launches |
 | `theme.rs`, `theme_picker.rs` | Color themes |
+| `update.rs` | Finding, downloading and installing new releases |
+| `platform.rs` | Mac app plumbing: locale for shells, folders opened from Finder, the About panel |
 
 Performance choices worth knowing about:
 
@@ -124,7 +170,8 @@ cargo test
 
 Unit tests cover the non-UI logic: path detection, key and mouse encoding,
 session-log parsing, chat filtering, line diffing, the pane layout tree,
-saved-state round trips and theme contrast.
+saved-state round trips, theme contrast, version comparison and swapping
+the app bundle during an update.
 
 ## Not yet
 

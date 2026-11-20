@@ -9,20 +9,24 @@ mod home;
 mod layout;
 mod links;
 mod pane;
+mod platform;
 mod session_list;
 mod sessions;
 mod terminal;
 mod text_input;
 mod theme;
 mod theme_picker;
+mod update;
 mod windows;
 mod workspace;
 
 use std::path::PathBuf;
 
-use gpui::{App, Application, KeyBinding, Menu, MenuItem};
+use futures::StreamExt as _;
+use gpui::{actions, App, Application, KeyBinding, Menu, MenuItem, SystemMenuType};
 
 use app_state::Store;
+use update::Updater;
 use workspace::{
     CloseTab, NewClaude, NewCodex, NewTerminal, NewWindow, NextPane, NextTab, OpenFolder, PrevPane,
     PrevTab, Quit, SearchChats, SelectTerminal1, SelectTerminal2, SelectTerminal3, SelectTerminal4,
@@ -30,16 +34,27 @@ use workspace::{
     SplitRight, ToggleSidebar,
 };
 
+actions!(
+    nexus,
+    [
+        About,
+        CheckForUpdates,
+        Hide,
+        HideOthers,
+        ShowAll,
+        Minimize,
+        Zoom,
+    ]
+);
+
 /// The folder named on the command line, if any. A file opens its folder.
 fn requested_root() -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::args_os().nth(1)?)
-        .canonicalize()
-        .ok()?;
-    if path.is_dir() {
-        Some(path)
-    } else {
-        path.parent().map(PathBuf::from)
+    // Flags are not folders; old systems pass `-psn_…` to apps they launch.
+    let argument = std::env::args_os().nth(1)?;
+    if argument.to_string_lossy().starts_with('-') {
+        return None;
     }
+    platform::folder_for(&PathBuf::from(argument))
 }
 
 /// Names of environment variables that mark this process as running inside
@@ -74,6 +89,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-f", SearchChats, None),
         KeyBinding::new("cmd-o", OpenFolder, None),
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-h", Hide, None),
+        KeyBinding::new("alt-cmd-h", HideOthers, None),
+        KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new("cmd-1", SelectTerminal1, None),
         KeyBinding::new("cmd-2", SelectTerminal2, None),
         KeyBinding::new("cmd-3", SelectTerminal3, None),
@@ -90,7 +108,18 @@ fn menus() -> Vec<Menu> {
     vec![
         Menu {
             name: "Nexus".into(),
-            items: vec![MenuItem::action("Quit Nexus", Quit)],
+            items: vec![
+                MenuItem::action("About Nexus", About),
+                MenuItem::action("Check for Updates…", CheckForUpdates),
+                MenuItem::separator(),
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide Nexus", Hide),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
+                MenuItem::action("Quit Nexus", Quit),
+            ],
         },
         Menu {
             name: "File".into(),
@@ -129,7 +158,37 @@ fn menus() -> Vec<Menu> {
                 MenuItem::action("Previous Pane", PrevPane),
             ],
         },
+        Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Minimize", Minimize),
+                MenuItem::action("Zoom", Zoom),
+            ],
+        },
     ]
+}
+
+/// Actions that belong to the app rather than to any one view.
+fn register_app_actions(cx: &mut App) {
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &NewWindow, cx| windows::open_home_window(cx));
+    cx.on_action(|_: &About, _| platform::show_about_panel());
+    cx.on_action(|_: &CheckForUpdates, cx| {
+        Updater::global(cx).update(cx, |updater, cx| updater.check(true, cx));
+    });
+    cx.on_action(|_: &Hide, cx| cx.hide());
+    cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+    cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    cx.on_action(|_: &Minimize, cx| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| window.minimize_window());
+        }
+    });
+    cx.on_action(|_: &Zoom, cx| {
+        if let Some(window) = cx.active_window() {
+            let _ = window.update(cx, |_, window, _| window.zoom_window());
+        }
+    });
 }
 
 fn main() {
@@ -140,41 +199,78 @@ fn main() {
     for name in inherited_agent_variables(std::env::vars_os().map(|(name, _)| name)) {
         std::env::remove_var(name);
     }
+    platform::ensure_locale();
     let requested = requested_root();
 
-    Application::new()
-        .with_assets(assets::Assets)
-        .run(move |cx: &mut App| {
-            let store = Store::load();
-            if let Some(name) = store.theme() {
-                theme::set_active_by_name(name);
+    // Folders opened from Finder, the Dock or `open -a Nexus` arrive as
+    // URLs, possibly before the app has finished launching.
+    let (opened_tx, mut opened_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
+    let app = Application::new().with_assets(assets::Assets);
+    app.on_open_urls(move |urls| {
+        let _ = opened_tx.unbounded_send(urls);
+    });
+    app.run(move |cx: &mut App| {
+        let store = Store::load();
+        if let Some(name) = store.theme() {
+            theme::set_active_by_name(name);
+        }
+        let reopen = store.reopen_list();
+        cx.set_global(store);
+        Updater::init(cx);
+
+        bind_keys(cx);
+        cx.set_menus(menus());
+        cx.set_dock_menu(vec![MenuItem::action("New Window", NewWindow)]);
+        register_app_actions(cx);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
             }
-            let reopen = store.reopen_list();
-            cx.set_global(store);
+        })
+        .detach();
 
-            bind_keys(cx);
-            cx.set_menus(menus());
-            cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.on_action(|_: &NewWindow, cx| windows::open_home_window(cx));
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
+        // Folders the app was launched to open are already waiting.
+        let mut requested: Vec<PathBuf> = requested.into_iter().collect();
+        while let Ok(urls) = opened_rx.try_recv() {
+            requested.extend(opened_folders(&urls));
+        }
 
-            // A folder on the command line wins; otherwise pick up where the
-            // last run left off, and failing that show the home view.
-            match requested {
-                Some(root) => windows::open_workspace_window(&root, cx),
-                None if !reopen.is_empty() => {
-                    for root in reopen {
+        // A folder named at launch wins; otherwise pick up where the last
+        // run left off, and failing that show the home view.
+        if !requested.is_empty() {
+            for root in requested {
+                windows::open_workspace_window(&root, cx);
+            }
+        } else if !reopen.is_empty() {
+            for root in reopen {
+                windows::open_workspace_window(&root, cx);
+            }
+        } else {
+            windows::open_home_window(cx);
+        }
+
+        cx.spawn(async move |cx| {
+            while let Some(urls) = opened_rx.next().await {
+                let opened = cx.update(|cx| {
+                    for root in opened_folders(&urls) {
                         windows::open_workspace_window(&root, cx);
                     }
+                });
+                if opened.is_err() {
+                    break;
                 }
-                None => windows::open_home_window(cx),
             }
-        });
+        })
+        .detach();
+    });
+}
+
+/// The folders named by URLs the system asked the app to open.
+fn opened_folders(urls: &[String]) -> Vec<PathBuf> {
+    urls.iter()
+        .filter_map(|url| platform::path_from_file_url(url))
+        .filter_map(|path| platform::folder_for(&path))
+        .collect()
 }
 
 #[cfg(test)]

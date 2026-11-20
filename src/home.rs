@@ -3,23 +3,25 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{
-    div, prelude::*, px, App, Context, Entity, FocusHandle, Focusable, FontWeight,
+    div, img, prelude::*, px, App, Context, Entity, FocusHandle, Focusable, FontWeight,
     PathPromptOptions, SharedString, Window,
 };
 
 use crate::app_state::{Store, WorkspaceRecord};
-use crate::assets::icon;
+use crate::assets::{icon, logo};
 use crate::links::home_dir;
 use crate::sessions::{format_age, now_secs};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme;
 use crate::theme_picker::ThemePicker;
+use crate::update::UpdateBadge;
 use crate::windows;
 use crate::workspace::OpenFolder;
 
 pub struct Home {
     search: Entity<TextInput>,
     theme_picker: Entity<ThemePicker>,
+    update_badge: Entity<UpdateBadge>,
     highlighted: usize,
 }
 
@@ -103,6 +105,7 @@ impl Home {
         Self {
             search,
             theme_picker: cx.new(|_| ThemePicker::new()),
+            update_badge: cx.new(UpdateBadge::new),
             highlighted: 0,
         }
     }
@@ -293,12 +296,14 @@ impl Render for Home {
                     .flex()
                     .items_center()
                     .justify_end()
+                    .gap(px(8.))
                     .px(px(10.))
                     .on_click(|event, window, _| {
                         if event.click_count() == 2 {
                             window.titlebar_double_click();
                         }
                     })
+                    .child(self.update_badge.clone())
                     .child(self.theme_picker.clone()),
             )
             .child(
@@ -319,18 +324,25 @@ impl Render for Home {
                             div()
                                 .flex_none()
                                 .flex()
-                                .flex_col()
-                                .gap(px(4.))
+                                .items_center()
+                                .gap(px(14.))
+                                .child(img(logo()).size(px(56.)).flex_none())
                                 .child(
                                     div()
-                                        .text_size(px(22.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child("Nexus"),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(theme::text_muted())
-                                        .child("Pick a workspace to enter, or open a folder."),
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.))
+                                        .child(
+                                            div()
+                                                .text_size(px(22.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child("Nexus"),
+                                        )
+                                        .child(
+                                            div().text_color(theme::text_muted()).child(
+                                                "Pick a workspace to enter, or open a folder.",
+                                            ),
+                                        ),
                                 ),
                         )
                         .child(
