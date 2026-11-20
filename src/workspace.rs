@@ -80,6 +80,15 @@ enum MenuChoice {
     Close,
 }
 
+/// Where a file that is not open yet gets its tab.
+pub enum FilePlacement<'a> {
+    /// In the focused pane: the file was picked in the sidebar.
+    ActivePane,
+    /// Out of the way of the terminal whose link was clicked: with the files
+    /// already open, or failing that in a new pane beside this one.
+    Beside(&'a Entity<Pane>),
+}
+
 /// Drag payload for the divider between two panes.
 struct SplitDrag {
     split_id: usize,
@@ -138,7 +147,7 @@ impl Workspace {
             window,
             |this, _, event: &FileTreeEvent, window, cx| match event {
                 FileTreeEvent::OpenFile(path) => {
-                    this.open_file(path.clone(), None, None, window, cx)
+                    this.open_file(path.clone(), None, FilePlacement::ActivePane, window, cx)
                 }
             },
         )
@@ -650,14 +659,17 @@ impl Workspace {
 
     // ---- files --------------------------------------------------------------
 
-    /// Picks where a file should open: next to the files already open, and
-    /// never on top of a running terminal.
+    /// Picks the pane a newly opened file goes in.
     fn file_target(
         &mut self,
-        source: Option<&Entity<Pane>>,
+        placement: FilePlacement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<Pane> {
+        let source = match placement {
+            FilePlacement::ActivePane => return self.active_pane.clone(),
+            FilePlacement::Beside(source) => source,
+        };
         if let Some(pane) = self.file_pane.as_ref().and_then(|pane| pane.upgrade()) {
             if self.center.contains(&pane) {
                 return pane;
@@ -670,13 +682,12 @@ impl Workspace {
         {
             return pane;
         }
-        let base = source.cloned().unwrap_or_else(|| self.active_pane.clone());
-        if base.read(cx).is_empty() {
-            return base;
+        if source.read(cx).is_empty() {
+            return source.clone();
         }
         let pane = self.create_pane(window, cx);
         self.center.split(
-            &base,
+            source,
             pane.clone(),
             Direction::Right,
             &mut self.next_split_id,
@@ -688,7 +699,7 @@ impl Workspace {
         &mut self,
         path: PathBuf,
         line: Option<u32>,
-        source: Option<&Entity<Pane>>,
+        placement: FilePlacement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -708,7 +719,7 @@ impl Workspace {
             }
         }
 
-        let target = self.file_target(source, window, cx);
+        let target = self.file_target(placement, window, cx);
         let root = self.root.clone();
         let view = cx.new(|cx| FileView::new(path.clone(), &root, line, cx));
         target.update(cx, |pane, cx| {
@@ -735,7 +746,13 @@ impl Workspace {
                 cx.notify();
             }
             LinkTarget::File { path, line, .. } => {
-                self.open_file(path.clone(), *line, Some(source), window, cx)
+                self.open_file(
+                    path.clone(),
+                    *line,
+                    FilePlacement::Beside(source),
+                    window,
+                    cx,
+                )
             }
         }
     }

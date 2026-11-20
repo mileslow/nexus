@@ -31,8 +31,9 @@ searchable list.
 - **Chats.** Claude Code and Codex sessions found on this machine, newest
   first, searchable by title or folder. Clicking one resumes it in the active
   pane, or focuses it if it is already open.
-- **Stays out of the way of files.** Files open beside the terminals rather
-  than on top of them, and gather in one pane.
+- **Files open where you expect.** A file picked in the sidebar opens as a
+  tab in the focused pane. A path `⌘`-clicked in a terminal opens beside that
+  terminal rather than on top of it, with the files already open.
 - **Workspaces that remember.** Each folder you open is a workspace with its
   own window. Nexus saves its panes, splits, tabs, open files, sidebar and the
   chats running in its terminals, and rebuilds them when you come back:
