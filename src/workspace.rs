@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
-    actions, anchored, deferred, div, prelude::*, px, relative, AnyElement, App, Axis, Context,
+    actions, anchored, deferred, div, prelude::*, px, relative, AnyElement, App, Axis,
+    ClipboardItem, Context,
     DragMoveEvent, EmptyView, Entity, EntityId, FocusHandle, Focusable, FontWeight, KeyDownEvent,
     MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, Task, WeakEntity,
     Window, WindowControlArea,
@@ -74,6 +75,7 @@ const SECTION_CHATS: usize = 2;
 
 #[derive(Clone, Copy)]
 enum MenuChoice {
+    Copy,
     Split(Direction),
     Close,
 }
@@ -114,6 +116,12 @@ struct TerminalMenu {
     position: Point<Pixels>,
     pane: Entity<Pane>,
     terminal: EntityId,
+    /// Whether the menu was opened over the terminal's text rather than its
+    /// row in the sidebar; only then does it offer Copy.
+    over_text: bool,
+    /// What was selected when the menu opened. Held here because output
+    /// arriving while the menu is up can clear the selection.
+    selection: Option<String>,
 }
 
 impl Focusable for Workspace {
@@ -758,7 +766,7 @@ impl Workspace {
             PaneEvent::Open(target) => self.open_link(target, pane, window, cx),
             PaneEvent::Split(direction) => self.split_pane(pane, *direction, window, cx),
             PaneEvent::ContextMenu { position, item } => {
-                self.open_terminal_menu(*position, pane.clone(), *item, cx)
+                self.open_terminal_menu(*position, pane.clone(), *item, true, cx)
             }
             PaneEvent::TabDropped {
                 item,
@@ -878,12 +886,23 @@ impl Workspace {
         position: Point<Pixels>,
         pane: Entity<Pane>,
         terminal: EntityId,
+        over_text: bool,
         cx: &mut Context<Self>,
     ) {
+        let selection = if over_text {
+            let pane = pane.read(cx);
+            pane.index_of(terminal)
+                .and_then(|index| pane.items()[index].as_terminal())
+                .and_then(|terminal| terminal.read(cx).selected_text())
+        } else {
+            None
+        };
         self.terminal_menu = Some(TerminalMenu {
             position,
             pane,
             terminal,
+            over_text,
+            selection,
         });
         cx.notify();
     }
@@ -905,11 +924,18 @@ impl Workspace {
             return;
         };
         cx.notify();
+        if let MenuChoice::Copy = choice {
+            if let Some(text) = menu.selection {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return;
+        }
         // The pane may have been closed while the menu was open.
         if !self.center.contains(&menu.pane) {
             return;
         }
         match choice {
+            MenuChoice::Copy => {}
             MenuChoice::Split(direction) => self.split_pane(&menu.pane, direction, window, cx),
             MenuChoice::Close => menu.pane.update(cx, |pane, cx| {
                 if let Some(index) = pane.index_of(menu.terminal) {
@@ -939,6 +965,26 @@ impl Workspace {
                         this.choose_from_terminal_menu(choice, window, cx)
                     }))
             };
+        // Copy stays in the menu with nothing selected, dimmed, so the other
+        // rows keep their places.
+        let copy = menu.over_text.then(|| {
+            let separator = div().h(px(1.)).my(px(4.)).mx(px(4.)).bg(theme::border());
+            let item = if menu.selection.is_some() {
+                row("menu-copy", "copy", "Copy", MenuChoice::Copy).into_any_element()
+            } else {
+                div()
+                    .h(px(26.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_color(theme::text_faint())
+                    .child(icon("copy", px(13.), theme::text_faint()))
+                    .child("Copy")
+                    .into_any_element()
+            };
+            [item, separator.into_any_element()]
+        });
         Some(
             deferred(
                 anchored()
@@ -961,6 +1007,7 @@ impl Workspace {
                             .on_mouse_down_out(
                                 cx.listener(|this, _, _, cx| this.dismiss_terminal_menu(cx)),
                             )
+                            .children(copy.into_iter().flatten())
                             .child(row(
                                 "menu-split-up",
                                 "arrow-up",
@@ -1191,6 +1238,7 @@ impl Workspace {
                                     event.position,
                                     menu_pane.clone(),
                                     terminal_id,
+                                    false,
                                     cx,
                                 )
                             }),

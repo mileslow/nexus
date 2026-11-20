@@ -74,6 +74,12 @@ const ICONS: &[(&str, &str)] = &[
     ("plus", icon_svg!(r#"<path d="M8 3v10M3 8h10"/>"#)),
     ("close", icon_svg!(r#"<path d="M4 4l8 8M12 4l-8 8"/>"#)),
     (
+        "copy",
+        icon_svg!(
+            r#"<rect x="5.500" y="5.500" width="8" height="8" rx="1.500"/><path d="M10.500 5.500V4A1.500 1.500 0 0 0 9 2.500H4A1.500 1.500 0 0 0 2.500 4v5A1.500 1.500 0 0 0 4 10.500h1.500"/>"#
+        ),
+    ),
+    (
         "menu",
         icon_svg!(r#"<path d="M2.500 4.500h11M2.500 8h11M2.500 11.500h11"/>"#),
     ),

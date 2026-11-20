@@ -724,9 +724,14 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+    /// The text currently selected with the mouse, if any.
+    pub fn selected_text(&self) -> Option<String> {
         let text = self.term.lock().selection_to_string();
-        if let Some(text) = text.filter(|text| !text.is_empty()) {
+        text.filter(|text| !text.is_empty())
+    }
+
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }

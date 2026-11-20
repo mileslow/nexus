@@ -163,7 +163,7 @@ for Windows. The Windows installer is described in
 | `⌘C` / `⌘V` / `⌘K` | `Ctrl+Shift+C` / `Ctrl+Shift+V` / `Ctrl+Shift+K` | Copy selection / paste / clear the terminal |
 | `⇧PageUp` / `⇧PageDown` | same | Scroll back through terminal history |
 | `⇧Enter` | same | Insert a newline in an agent prompt |
-| Right-click a terminal | same | Split up / right / down / left, or close it |
+| Right-click a terminal | same | Copy the selected text, split up / right / down / left, or close it |
 | Drag a tab | same | Reorder it, move it to another pane, or drop on a pane's edge to split |
 | Drag a file from the sidebar | same | Type its path into the terminal or chat it is dropped on |
 
