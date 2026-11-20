@@ -5,6 +5,7 @@ mod assets;
 mod diff;
 mod file_tree;
 mod file_view;
+mod find;
 mod home;
 mod layout;
 mod links;
@@ -69,6 +70,7 @@ fn inherited_agent_variables(
 
 fn bind_keys(cx: &mut App) {
     text_input::bind_keys(cx);
+    find::bind_keys(cx);
     terminal::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new("cmd-shift-n", NewWindow, None),
@@ -139,6 +141,10 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action("Copy", terminal::Copy),
                 MenuItem::action("Paste", terminal::Paste),
+                MenuItem::separator(),
+                MenuItem::action("Find…", find::Find),
+                MenuItem::action("Find Next", find::FindNext),
+                MenuItem::action("Find Previous", find::FindPrevious),
                 MenuItem::separator(),
                 MenuItem::action("Clear Terminal", terminal::Clear),
             ],

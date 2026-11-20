@@ -16,6 +16,7 @@ use crate::app_state::{SavedAxis, SavedChat, SavedLayout, SavedNode, SavedTab, S
 use crate::assets::icon;
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::file_view::FileView;
+use crate::find::{Find, FindNext, FindPrevious};
 use crate::home::display_path;
 use crate::layout::{Direction, Node};
 use crate::links::{self, LinkTarget};
@@ -1518,6 +1519,29 @@ impl Workspace {
         self.spawn_agent(Agent::Codex, window, cx);
     }
 
+    /// `⌘F` searches whatever the active pane is showing.
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        match self.active_pane.read(cx).active_item().cloned() {
+            Some(PaneItem::Terminal(terminal)) => {
+                terminal.update(cx, |terminal, cx| terminal.open_find(window, cx))
+            }
+            Some(PaneItem::File(file)) => file.update(cx, |file, cx| file.open_find(window, cx)),
+            None => {}
+        }
+    }
+
+    /// `⌘G` and `⌘⇧G` repeat the search without going back to the bar.
+    fn find_again(&mut self, onward: bool, cx: &mut Context<Self>) {
+        match self.active_pane.read(cx).active_item().cloned() {
+            // In a terminal, onward is up: toward older output.
+            Some(PaneItem::Terminal(terminal)) => {
+                terminal.update(cx, |terminal, cx| terminal.find_step(!onward, cx))
+            }
+            Some(PaneItem::File(file)) => file.update(cx, |file, cx| file.find_step(onward, cx)),
+            None => {}
+        }
+    }
+
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.active_pane.clone();
         if pane.read(cx).is_empty() {
@@ -1598,6 +1622,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::new_claude))
             .on_action(cx.listener(Self::new_codex))
             .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(|this, _: &FindNext, _, cx| this.find_again(true, cx)))
+            .on_action(cx.listener(|this, _: &FindPrevious, _, cx| this.find_again(false, cx)))
             .on_action(cx.listener(Self::split_right))
             .on_action(cx.listener(Self::split_down))
             .on_action(cx.listener(Self::next_tab))

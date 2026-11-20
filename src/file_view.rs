@@ -12,9 +12,9 @@ use std::time::SystemTime;
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
-    div, img, prelude::*, px, uniform_list, App, ClipboardItem, Context, FocusHandle, Focusable,
-    HighlightStyle, Hsla, ListHorizontalSizingBehavior, ObjectFit, Rgba, ScrollStrategy,
-    SharedString, StyledText, Task, UniformListScrollHandle, Window,
+    combine_highlights, div, img, point, prelude::*, px, uniform_list, App, ClipboardItem, Context,
+    Entity, FocusHandle, Focusable, HighlightStyle, Hsla, ListHorizontalSizingBehavior, ObjectFit,
+    Pixels, Rgba, ScrollStrategy, SharedString, StyledText, Task, UniformListScrollHandle, Window,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
@@ -22,6 +22,7 @@ use syntect::parsing::SyntaxSet;
 
 use crate::assets::icon;
 use crate::diff::{self, Baseline, Diff, RowKind};
+use crate::find::{self, FindBar, FindEvent};
 use crate::theme;
 
 const MAX_FILE_BYTES: u64 = 24 * 1024 * 1024;
@@ -100,6 +101,14 @@ pub struct FileView {
     /// The theme the current highlights were computed for.
     highlight_theme: usize,
     cancel_highlight: Arc<AtomicBool>,
+    find_bar: Entity<FindBar>,
+    find_open: bool,
+    /// Every match of the find query: its line and byte range, in order.
+    find_matches: Vec<(usize, Range<usize>)>,
+    find_current: Option<usize>,
+    /// Measured while drawing, to bring a match on a long line into view.
+    gutter_width: Pixels,
+    char_width: Pixels,
     _load: Option<Task<()>>,
     _highlight: Option<Task<()>>,
 }
@@ -459,10 +468,13 @@ impl FileView {
             .strip_prefix(root)
             .map(|relative| relative.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+        let focus_handle = cx.focus_handle();
+        let find_bar = cx.new(|cx| FindBar::new(focus_handle.clone(), false, cx));
+        cx.subscribe(&find_bar, Self::on_find_event).detach();
         let mut this = Self {
             path,
             display_path: display_path.into(),
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             content: Content::Loading,
             scroll: UniformListScrollHandle::new(),
             highlighted_line: None,
@@ -476,6 +488,12 @@ impl FileView {
             checking: false,
             highlight_theme: theme::active_index(),
             cancel_highlight: Arc::new(AtomicBool::new(false)),
+            find_bar,
+            find_open: false,
+            find_matches: Vec::new(),
+            find_current: None,
+            gutter_width: px(0.),
+            char_width: px(7.5),
             _load: None,
             _highlight: None,
         };
@@ -536,6 +554,133 @@ impl FileView {
             self.pending_scroll = Some(index);
         }
         cx.notify();
+    }
+
+    // ---- find -----------------------------------------------------------------
+
+    /// Opens the find bar, or returns to it if it is already open.
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_open = true;
+        self.find_bar.update(cx, |bar, cx| bar.focus(window, cx));
+        self.refresh_find(true, cx);
+    }
+
+    fn on_find_event(&mut self, _: Entity<FindBar>, event: &FindEvent, cx: &mut Context<Self>) {
+        match event {
+            FindEvent::Changed => self.refresh_find(true, cx),
+            FindEvent::Next => self.find_step(true, cx),
+            FindEvent::Previous => self.find_step(false, cx),
+            FindEvent::Dismissed => {
+                self.find_open = false;
+                self.find_matches.clear();
+                self.find_current = None;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Searches the file again. `jump` moves to the first match at or below
+    /// the top of the view; without it the view stays where it is.
+    fn refresh_find(&mut self, jump: bool, cx: &mut Context<Self>) {
+        let query = self.find_bar.read(cx).query(cx);
+        let mut matches = Vec::new();
+        if let (true, Content::Text(text)) = (self.find_open, &self.content) {
+            let case_sensitive = find::is_case_sensitive(&query);
+            'lines: for (index, line) in text.lines.iter().enumerate() {
+                for range in find::find_in_line(line, &query, case_sensitive) {
+                    matches.push((index, range));
+                    if matches.len() >= find::MAX_MATCHES {
+                        break 'lines;
+                    }
+                }
+            }
+        }
+        self.find_matches = matches;
+        self.find_current = if self.find_matches.is_empty() {
+            None
+        } else if jump {
+            let top = self.top_row();
+            let below = self
+                .find_matches
+                .iter()
+                .position(|(line, _)| self.row_for_line(*line) >= top);
+            Some(below.unwrap_or(0))
+        } else {
+            self.find_current
+                .map(|current| current.min(self.find_matches.len() - 1))
+        };
+        if jump {
+            self.reveal_current_match();
+        }
+        self.report_find(cx);
+    }
+
+    /// Steps to the match below (`forward`) or above the current one.
+    pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !self.find_open {
+            return;
+        }
+        self.find_current = find::step(self.find_current, self.find_matches.len(), forward);
+        self.reveal_current_match();
+        self.report_find(cx);
+    }
+
+    fn report_find(&mut self, cx: &mut Context<Self>) {
+        let (current, total) = (self.find_current, self.find_matches.len());
+        self.find_bar
+            .update(cx, |bar, cx| bar.set_results(current, total, cx));
+        cx.notify();
+    }
+
+    /// Scrolls so the current match is on screen, both down and across.
+    fn reveal_current_match(&mut self) {
+        let Some((line, range)) = self
+            .find_current
+            .and_then(|current| self.find_matches.get(current))
+            .cloned()
+        else {
+            return;
+        };
+        let Content::Text(text) = &self.content else {
+            return;
+        };
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let viewport = handle.bounds().size;
+        let offset = handle.offset();
+
+        let row = self.row_for_line(line);
+        let top = self.top_row();
+        let visible_rows = (f32::from(viewport.height) / LINE_HEIGHT).floor() as usize;
+        if row < top || row + 1 >= top + visible_rows.max(1) {
+            self.scroll
+                .scroll_to_item_strict(row, ScrollStrategy::Center);
+        }
+
+        // The font is monospaced, so columns are a matter of counting.
+        let Some(line_text) = text.lines.get(line) else {
+            return;
+        };
+        let columns_before = line_text[..range.start.min(line_text.len())]
+            .chars()
+            .count();
+        let columns = line_text[range.start.min(line_text.len())..range.end.min(line_text.len())]
+            .chars()
+            .count();
+        let start = self.gutter_width + self.char_width * columns_before as f32;
+        let end = start + self.char_width * columns as f32;
+        let left = -offset.x;
+        let right = left + viewport.width;
+        if viewport.width > px(0.) && (end > right - px(24.) || start < left + self.gutter_width) {
+            let target = (start - viewport.width / 2.).max(px(0.));
+            handle.set_offset(point(-target, offset.y));
+        }
+    }
+
+    /// The matches on one line: the index of the first, and their ranges.
+    fn matches_on_line(&self, line: usize) -> (usize, &[(usize, Range<usize>)]) {
+        let start = self.find_matches.partition_point(|(at, _)| *at < line);
+        let end = self.find_matches.partition_point(|(at, _)| *at <= line);
+        (start, &self.find_matches[start..end])
     }
 
     /// Switches between the unified diff and the plain file, keeping the
@@ -624,8 +769,11 @@ impl FileView {
                 })
             }
         };
-        // The set of changes may be different now.
+        // The set of changes may be different now, and so may the matches.
         self.hunk_cursor = None;
+        if self.find_open {
+            self.refresh_find(false, cx);
+        }
         if matches!(self.content, Content::Text(_)) {
             if let Some(index) = self.pending_scroll.take() {
                 self.scroll
@@ -748,19 +896,50 @@ impl FileView {
                     .and_then(|index| text.highlights.get(index))
                     .and_then(|spans| spans.as_ref())
                     .filter(|spans| !spans.is_empty());
-                let styled = match spans {
-                    Some(spans) => StyledText::new(content).with_highlights(spans.iter().map(
-                        |(range, color)| {
-                            (
-                                range.clone(),
-                                HighlightStyle {
-                                    color: Some(*color),
-                                    ..Default::default()
-                                },
-                            )
-                        },
-                    )),
-                    None => StyledText::new(content),
+                let syntax = spans.into_iter().flat_map(|spans| {
+                    spans.iter().map(|(range, color)| {
+                        (
+                            range.clone(),
+                            HighlightStyle {
+                                color: Some(*color),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                });
+                let (first_match, found) = match line_index {
+                    Some(index) if !self.find_matches.is_empty() => self.matches_on_line(index),
+                    _ => (0, &[][..]),
+                };
+                let styled = if found.is_empty() {
+                    match spans {
+                        Some(_) => StyledText::new(content).with_highlights(syntax),
+                        None => StyledText::new(content),
+                    }
+                } else {
+                    let length = content.len();
+                    let found = found.iter().enumerate().filter_map(|(offset, (_, range))| {
+                        // A reload can leave a match pointing past a shorter line.
+                        if range.end > length || !content.is_char_boundary(range.start) {
+                            return None;
+                        }
+                        let style = if Some(first_match + offset) == self.find_current {
+                            let (background, text) = find::current_match_colors();
+                            HighlightStyle {
+                                color: Some(text),
+                                background_color: Some(background),
+                                ..Default::default()
+                            }
+                        } else {
+                            HighlightStyle {
+                                background_color: Some(find::match_color()),
+                                ..Default::default()
+                            }
+                        };
+                        Some((range.clone(), style))
+                    });
+                    let combined: Vec<_> = combine_highlights(syntax, found).collect();
+                    StyledText::new(content).with_highlights(combined)
                 };
 
                 let highlighted = line_index.is_some() && line_index == self.highlighted_line;
@@ -915,7 +1094,12 @@ impl FileView {
 }
 
 impl Render for FileView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text_system = window.text_system();
+        let font_id = text_system.resolve_font(&gpui::font(theme::MONO_FONT));
+        if let Ok(advance) = text_system.advance(font_id, theme::MONO_TEXT_SIZE, 'm') {
+            self.char_width = advance.width;
+        }
         // Syntax colors belong to the theme they were computed for.
         if self.highlight_theme != theme::active_index() {
             if let Content::Text(text) = &mut self.content {
@@ -960,6 +1144,7 @@ impl Render for FileView {
                 };
                 let digits = last_number.max(1).to_string().len().max(3);
                 let gutter_width = px(digits as f32 * 7.6 + 36.);
+                self.gutter_width = gutter_width;
                 uniform_list(
                     "file-lines",
                     row_count,
@@ -975,6 +1160,13 @@ impl Render for FileView {
             }
         };
         let change_bar = self.render_change_bar(cx);
+        let find_bar = self.find_open.then(|| {
+            div()
+                .absolute()
+                .top(px(8.))
+                .right(px(18.))
+                .child(self.find_bar.clone())
+        });
 
         div()
             .size_full()
@@ -1015,7 +1207,9 @@ impl Render for FileView {
                     .font_family(theme::MONO_FONT)
                     .text_size(theme::MONO_TEXT_SIZE)
                     .text_color(theme::text())
-                    .child(body),
+                    .relative()
+                    .child(body)
+                    .children(find_bar),
             )
     }
 }

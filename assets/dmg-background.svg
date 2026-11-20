@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" viewBox="0 0 640 400">
+  <!-- Backdrop of the installer disk image. Mid-tone on purpose: Finder draws
+       icon names in black or white depending on the system appearance, and
+       both have to be readable. Rebuilt by scripts/make-icon.sh. -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5a67d8"/>
+      <stop offset="0.55" stop-color="#7467d6"/>
+      <stop offset="1" stop-color="#9a63c9"/>
+    </linearGradient>
+    <radialGradient id="cool" cx="90" cy="380" r="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#38bdf8" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="warm" cx="590" cy="20" r="340" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f472b6" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#f472b6" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="640" height="400" fill="url(#sky)"/>
+  <rect width="640" height="400" fill="url(#cool)"/>
+  <rect width="640" height="400" fill="url(#warm)"/>
+
+  <text x="320" y="62" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif"
+        font-size="22" font-weight="500" fill="#ffffff">Drag Nexus into Applications</text>
+
+  <!-- The arrow between the two icons, which sit at x=170 and x=470. -->
+  <g fill="none" stroke="#ffffff" stroke-opacity="0.9" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M272 190H362"/>
+    <path d="M342 168L366 190L342 212"/>
+  </g>
+
+  <text x="320" y="368" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif"
+        font-size="12" fill="#ffffff" fill-opacity="0.8">Then open Nexus from Applications or Spotlight</text>
+</svg>

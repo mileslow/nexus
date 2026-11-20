@@ -104,6 +104,13 @@ impl TextInput {
         &self.content
     }
 
+    /// Selects the whole text, so typing replaces it.
+    pub fn select_everything(&mut self, cx: &mut Context<Self>) {
+        self.selection_reversed = false;
+        self.selected_range = 0..self.content.len();
+        cx.notify();
+    }
+
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         if self.content.is_empty() {
             return;

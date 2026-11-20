@@ -3,7 +3,9 @@
 #
 #   scripts/bundle.sh              build for this Mac
 #   scripts/bundle.sh --universal  build for Apple silicon and Intel
-#   scripts/bundle.sh --package    also write dist/Nexus.zip and dist/latest.json
+#   scripts/bundle.sh --package    also write dist/Nexus.dmg (the download),
+#                                  dist/Nexus.zip and dist/latest.json (what
+#                                  the in-app updater fetches)
 #   scripts/bundle.sh --install    also copy the app into /Applications
 #
 # NEXUS_SIGN_IDENTITY names a signing identity (for example a "Developer ID
@@ -65,7 +67,20 @@ codesign --verify --deep --strict "$app"
 echo "built $app ($version, $(lipo -archs "$app/Contents/MacOS/nexus"))"
 
 if [ "$package" -eq 1 ]; then
-    rm -f dist/Nexus.zip dist/latest.json
+    rm -f dist/Nexus.dmg dist/Nexus.zip dist/latest.json
+
+    # The disk image people download: open it and drag Nexus to Applications.
+    # dmgbuild lays the window out without needing Finder, so it works on CI.
+    dmgbuild=target/dmgbuild/bin/dmgbuild
+    if [ ! -x "$dmgbuild" ]; then
+        /usr/bin/python3 -m venv target/dmgbuild
+        target/dmgbuild/bin/pip install --quiet --disable-pip-version-check dmgbuild==1.6.5
+    fi
+    "$dmgbuild" -s scripts/dmg-settings.py \
+        -D app="$app" -D icon=assets/Nexus.icns -D background=assets/dmg-background.png \
+        Nexus dist/Nexus.dmg >/dev/null
+
+    # The same app as a zip, with its checksum, for the updater and install.sh.
     ditto -c -k --keepParent "$app" dist/Nexus.zip
     sha="$(shasum -a 256 dist/Nexus.zip | cut -d ' ' -f 1)"
     cat >dist/latest.json <<JSON
@@ -75,7 +90,7 @@ if [ "$package" -eq 1 ]; then
   "sha256": "$sha"
 }
 JSON
-    echo "packaged dist/Nexus.zip and dist/latest.json"
+    echo "packaged dist/Nexus.dmg, dist/Nexus.zip and dist/latest.json"
 fi
 
 if [ "$install" -eq 1 ]; then

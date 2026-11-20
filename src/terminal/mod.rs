@@ -5,6 +5,7 @@ pub mod element;
 pub mod keys;
 mod proc;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::os::fd::{AsRawFd, RawFd};
@@ -16,10 +17,11 @@ use std::time::{Duration, Instant};
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Direction, Line, Point as AlacPoint};
+use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point as AlacPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty;
 use futures::channel::mpsc::{unbounded, UnboundedSender};
@@ -32,6 +34,7 @@ use gpui::{
 };
 
 use crate::file_tree::DraggedPath;
+use crate::find::{self, FindBar, FindEvent};
 use crate::links::{self, Link, LinkTarget};
 use crate::sessions::{shell_quote, Agent};
 use crate::theme;
@@ -183,6 +186,11 @@ pub struct TerminalView {
     hovered_link: Option<HoveredLink>,
     hover_cell: Option<AlacPoint>,
     marked_text: Option<String>,
+    find_bar: Entity<FindBar>,
+    find_open: bool,
+    /// The compiled find query. Drawing borrows it to mark what is on screen.
+    find_regex: RefCell<Option<RegexSearch>>,
+    find_current: Option<Match>,
     _events: Task<()>,
 }
 
@@ -321,6 +329,9 @@ impl TerminalView {
                 this.focus_changed(false, cx)
             })
             .detach();
+            // A search works back from the newest output, so Enter steps up.
+            let find_bar = cx.new(|cx| FindBar::new(focus_handle.clone(), true, cx));
+            cx.subscribe(&find_bar, Self::on_find_event).detach();
 
             let now = Instant::now();
             let mut this = Self {
@@ -364,6 +375,10 @@ impl TerminalView {
                 hovered_link: None,
                 hover_cell: None,
                 marked_text: None,
+                find_bar,
+                find_open: false,
+                find_regex: RefCell::new(None),
+                find_current: None,
                 _events: events,
             };
             this.refresh_process();
@@ -656,7 +671,11 @@ impl TerminalView {
 
     // ---- keyboard -----------------------------------------------------------
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Keys typed into the find bar belong to it, not to the shell.
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
         let keystroke = &event.keystroke;
         let mode = self.mode();
 
@@ -729,8 +748,132 @@ impl TerminalView {
 
     fn clear(&mut self, _: &Clear, _: &mut Window, cx: &mut Context<Self>) {
         self.term.lock().grid_mut().clear_history();
+        self.find_current = None;
         // Ctrl-L asks the foreground program to redraw a clean screen.
         self.input(vec![0x0c], cx);
+    }
+
+    // ---- find -----------------------------------------------------------------
+
+    /// Opens the find bar, or returns to it if it is already open.
+    pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_open = true;
+        self.find_bar.update(cx, |bar, cx| bar.focus(window, cx));
+        self.set_find_query(cx);
+    }
+
+    fn on_find_event(&mut self, _: Entity<FindBar>, event: &FindEvent, cx: &mut Context<Self>) {
+        match event {
+            FindEvent::Changed => self.set_find_query(cx),
+            FindEvent::Next => self.find_step(true, cx),
+            FindEvent::Previous => self.find_step(false, cx),
+            FindEvent::Dismissed => {
+                self.find_open = false;
+                *self.find_regex.borrow_mut() = None;
+                self.find_current = None;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Compiles the query in the bar and moves to the nearest match at or
+    /// above the bottom of the screen.
+    fn set_find_query(&mut self, cx: &mut Context<Self>) {
+        let query = self.find_bar.read(cx).query(cx);
+        *self.find_regex.borrow_mut() = if query.is_empty() {
+            None
+        } else {
+            RegexSearch::new(&literal_pattern(&query)).ok()
+        };
+        self.find_current = None;
+        self.find_step(false, cx);
+    }
+
+    /// Steps to the match below (`forward`) or above the current one,
+    /// wrapping around the ends of the scrollback.
+    pub fn find_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if !self.find_open {
+            return;
+        }
+        let mut found = None;
+        let mut position = None;
+        let mut total = 0;
+        if let Some(regex) = self.find_regex.borrow_mut().as_mut() {
+            let mut term = self.term.lock();
+            // Output and resizing move the grid under a remembered match.
+            let last = AlacPoint::new(term.bottommost_line(), term.last_column());
+            let first = AlacPoint::new(term.topmost_line(), Column(0));
+            let current = self.find_current.take().filter(|current| {
+                *current.start() >= first
+                    && *current.end() <= last
+                    && current.start().column <= last.column
+                    && current.end().column <= last.column
+            });
+            let (origin, direction, side) = match (&current, forward) {
+                (Some(current), true) => (
+                    current.end().add(&*term, Boundary::None, 1),
+                    Direction::Right,
+                    Side::Left,
+                ),
+                (Some(current), false) => (
+                    current.start().sub(&*term, Boundary::None, 1),
+                    Direction::Left,
+                    Side::Right,
+                ),
+                (None, _) => {
+                    let offset = term.grid().display_offset() as i32;
+                    let bottom = Line(term.screen_lines() as i32 - 1 - offset);
+                    (
+                        AlacPoint::new(bottom, term.last_column()),
+                        Direction::Left,
+                        Side::Right,
+                    )
+                }
+            };
+            found = term.search_next(regex, origin, direction, side, None);
+            if let Some(found) = &found {
+                // Bring an off-screen match a third of the way down, clear of
+                // the find bar and with some of what led up to it.
+                let offset = term.grid().display_offset() as i32;
+                let rows = term.screen_lines() as i32;
+                let line = found.start().line.0;
+                if !(3..rows).contains(&(line + offset)) {
+                    let wanted = (rows / 3 - line).clamp(0, term.grid().history_size() as i32);
+                    term.scroll_display(Scroll::Delta(wanted - offset));
+                }
+                for other in RegexIter::new(first, last, Direction::Right, &*term, regex) {
+                    if other == *found {
+                        position = Some(total);
+                    }
+                    total += 1;
+                    if total >= find::MAX_MATCHES {
+                        break;
+                    }
+                }
+            }
+        }
+        self.find_current = found;
+        self.find_bar
+            .update(cx, |bar, cx| bar.set_results(position, total, cx));
+        cx.notify();
+    }
+
+    /// The matches on screen, top to bottom, and the one the search is on.
+    pub(crate) fn visible_matches(&self, term: &Term<Listener>) -> (Vec<Match>, Option<Match>) {
+        let mut regex = self.find_regex.borrow_mut();
+        let Some(regex) = regex.as_mut().filter(|_| self.find_open) else {
+            return (Vec::new(), None);
+        };
+        let offset = term.grid().display_offset() as i32;
+        let top = AlacPoint::new(Line(-offset), Column(0));
+        let bottom = AlacPoint::new(
+            Line(term.screen_lines() as i32 - 1 - offset),
+            term.last_column(),
+        );
+        let matches = RegexIter::new(top, bottom, Direction::Right, term, regex)
+            .take(2_000)
+            .collect();
+        (matches, self.find_current.clone())
     }
 
     fn on_drop_paths(
@@ -1106,13 +1249,44 @@ impl Render for TerminalView {
             .on_drop(cx.listener(Self::on_drop_dragged_path))
             .drag_over::<DraggedPath>(|style, _, _, _| style.bg(theme::bg_hover()))
             .child(element::TerminalElement::new(cx.entity(), focused))
+            .when(self.find_open, |root| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top(px(8.))
+                        .right(px(18.))
+                        .child(self.find_bar.clone()),
+                )
+            })
     }
+}
+
+/// A regular expression that matches `query` as plain text.
+fn literal_pattern(query: &str) -> String {
+    let mut pattern = String::with_capacity(query.len() + 8);
+    for c in query.chars() {
+        if r"\.+*?()|[]{}^$#&-~".contains(c) {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn find_queries_are_searched_as_plain_text() {
+        assert_eq!(literal_pattern("main.rs"), r"main\.rs");
+        assert_eq!(literal_pattern("f(x) [y]"), r"f\(x\) \[y\]");
+        assert_eq!(literal_pattern(r"a\b"), r"a\\b");
+        assert_eq!(literal_pattern("plain words"), "plain words");
+        // Every escaped pattern compiles.
+        assert!(RegexSearch::new(&literal_pattern("*?+{[(|^$.#&-~")).is_ok());
+    }
 
     #[test]
     fn dropped_paths_become_mentions_for_agents_and_quoted_paths_for_shells() {

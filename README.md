@@ -46,25 +46,28 @@ searchable list.
   terminal to type its path there. An agent gets an `@` mention relative to
   its folder, which attaches the file to the chat; a shell gets the quoted
   path. Files dragged in from Finder work too.
+- **Find.** `⌘F` searches the terminal's scrollback or the open file, marks
+  every match and counts them. Enter steps through them (upward in a terminal,
+  from the newest output back), `⇧Enter` goes the other way, and `Esc` closes
+  the bar. Lowercase searches ignore case; a capital letter makes them exact.
 - **Themes.** Thirteen color themes (ten dark, three light), including Owlet,
   Night Owl, Dracula, One Dark and both Solarized variants, switched from the
   palette button in the title bar and applied to every window at once.
 
 ## Install
 
+Download **[Nexus.dmg](https://github.com/mileslow/nexus/releases/latest/download/Nexus.dmg)**,
+open it, and drag Nexus into Applications.
+
+Releases are not notarized by Apple, so macOS blocks the first launch of a
+copy downloaded with a browser: allow it under System Settings → Privacy &
+Security → Open Anyway. Installing from a terminal avoids that, and also
+links a `nexus` command onto your `PATH` (`nexus ~/code/app` opens a folder,
+in the running app if there is one):
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mileslow/nexus/main/install.sh | sh
 ```
-
-This puts the latest release in `/Applications` and links a `nexus` command
-onto your `PATH` (`nexus ~/code/app` opens a folder, in the running app if
-there is one). Or download `Nexus.zip` from the
-[latest release](https://github.com/mileslow/nexus/releases/latest) and drag
-`Nexus.app` into Applications yourself.
-
-Releases are not notarized by Apple. The install script is unaffected, but a
-copy downloaded with a browser is blocked the first time you open it: allow it
-under System Settings → Privacy & Security → Open Anyway.
 
 The `claude` and `codex` commands must be on the `PATH` of your login shell.
 
@@ -97,12 +100,14 @@ scripts/release.sh patch    # or minor, major, or an exact version like 0.4.2
 
 That bumps the version in `Cargo.toml`, commits, tags and pushes. The
 [release workflow](.github/workflows/release.yml) then runs the tests, builds
-a universal `Nexus.app`, and publishes `Nexus.zip` and `latest.json` as a
-GitHub release. Installed copies find it on their next update check.
+a universal `Nexus.app`, and publishes it as a GitHub release: `Nexus.dmg` to
+download, plus `Nexus.zip` and `latest.json` for the updater. Installed copies
+find it on their next update check.
 
 To sign with a Developer ID certificate instead of ad hoc, set
 `NEXUS_SIGN_IDENTITY` when running `scripts/bundle.sh`. The icon is drawn in
-`assets/icon.svg`; `scripts/make-icon.sh` rebuilds `Nexus.icns` from it.
+`assets/icon.svg` and the disk image's backdrop in `assets/dmg-background.svg`;
+`scripts/make-icon.sh` rebuilds the images from them.
 
 ## Keys
 
@@ -118,6 +123,8 @@ To sign with a Developer ID certificate instead of ad hoc, set
 | `⌃Tab` / `⌃⇧Tab` | Next / previous tab |
 | `⌘1`–`⌘9` | Jump to the nth terminal in the sidebar |
 | `⌘P` | Search chats (`↑`/`↓` to move, `Enter` to open, `Esc` to leave) |
+| `⌘F` | Find in the terminal or file (`Enter` / `⇧Enter` to step, `Esc` to close) |
+| `⌘G` / `⌘⇧G` | Next / previous match |
 | `⌘B` | Toggle the sidebar |
 | `⌘H` / `⌘M` | Hide Nexus / minimize the window |
 | `⌘`-click | Open the path or URL under the pointer |
@@ -146,6 +153,7 @@ onto a terminal pastes their paths.
 | `home.rs`, `windows.rs` | The home view, and opening windows |
 | `app_state.rs` | What is remembered between launches |
 | `theme.rs`, `theme_picker.rs` | Color themes |
+| `find.rs` | The find bar and text matching |
 | `update.rs` | Finding, downloading and installing new releases |
 | `platform.rs` | Mac app plumbing: locale for shells, folders opened from Finder, the About panel |
 
@@ -170,8 +178,8 @@ cargo test
 
 Unit tests cover the non-UI logic: path detection, key and mouse encoding,
 session-log parsing, chat filtering, line diffing, the pane layout tree,
-saved-state round trips, theme contrast, version comparison and swapping
-the app bundle during an update.
+saved-state round trips, theme contrast, find matching, version comparison
+and swapping the app bundle during an update.
 
 ## Not yet
 

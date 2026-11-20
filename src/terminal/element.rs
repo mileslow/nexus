@@ -424,6 +424,10 @@ fn snapshot(view: &TerminalView, size: TermSize) -> Snapshot {
     let cursor_shape = content.cursor.shape;
     let default_bg = AnsiColor::Named(NamedColor::Background);
     let selection_color: Hsla = theme::selection().into();
+    let (found, current_match) = view.visible_matches(&term);
+    let (current_bg, current_fg) = crate::find::current_match_colors();
+    let match_bg = crate::find::match_color();
+    let mut next_match = 0;
 
     let mut batches: Vec<Batch> = Vec::with_capacity(size.rows * 3);
     let mut backgrounds: Vec<BackgroundSpan> = Vec::new();
@@ -481,6 +485,18 @@ fn snapshot(view: &TerminalView, size: TermSize) -> Snapshot {
         }
         if flags.contains(Flags::DIM) {
             fg.a *= 0.6;
+        }
+        // Cells and matches both run top to bottom, so one cursor follows.
+        while found.get(next_match).is_some_and(|m| *m.end() < point) {
+            next_match += 1;
+        }
+        if let Some(found) = found.get(next_match).filter(|m| *m.start() <= point) {
+            if current_match.as_ref() == Some(found) {
+                bg = Some(current_bg);
+                fg = current_fg;
+            } else {
+                bg = Some(match_bg);
+            }
         }
         if selection.is_some_and(|range| range.contains(point)) {
             bg = Some(selection_color);
