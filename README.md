@@ -2,7 +2,7 @@
 
 # Nexus
 
-A fast agent multiplexer / IDE for macOS, built with Rust and [GPUI](https://gpui.rs).
+A fast agent multiplexer / IDE for macOS and Windows, built with Rust and [GPUI](https://gpui.rs).
 
 Run Claude Code, Codex and plain shells side by side in tiled panes, browse the
 project's files next to them, and jump back into any past chat from a
@@ -13,7 +13,8 @@ searchable list.
 - **Tiled terminals.** Split right or down, drag dividers to resize, and keep
   several tabs per pane. Every terminal is listed in the sidebar with a dot
   showing whether it is working, finished while you were elsewhere, or rang
-  the bell. `⌘1`–`⌘9` jump straight to one.
+  the bell. `⌘1`–`⌘9` jump straight to one. (Shortcuts are written here as
+  on a Mac; [Keys](#keys) lists the Windows ones.)
 - **File explorer.** A lazily loaded tree of the open folder. Click a file to
   view it with syntax highlighting; the view reloads when the file changes on
   disk, so you can watch an agent edit it.
@@ -56,6 +57,8 @@ searchable list.
 
 ## Install
 
+### macOS
+
 Download **[Nexus.dmg](https://github.com/mileslow/nexus/releases/latest/download/Nexus.dmg)**,
 open it, and drag Nexus into Applications.
 
@@ -71,14 +74,30 @@ curl -fsSL https://raw.githubusercontent.com/mileslow/nexus/main/install.sh | sh
 
 The `claude` and `codex` commands must be on the `PATH` of your login shell.
 
+### Windows
+
+Download and run **[Nexus-Setup.exe](https://github.com/mileslow/nexus/releases/latest/download/Nexus-Setup.exe)**
+(Windows 10 or 11, 64-bit). It installs for your user only, so it never asks
+for an administrator, and adds Nexus to the Start menu and **Open with
+Nexus** to the folder menu in Explorer.
+
+Releases are not signed with a Windows certificate, so SmartScreen warns on
+the first run: choose **More info → Run anyway**.
+
+Terminals run PowerShell (`pwsh` when PowerShell 7 is installed, otherwise
+Windows PowerShell); set `NEXUS_SHELL` to use another, such as `cmd.exe` or
+Git's `bash.exe`. The `claude` and `codex` commands must work in that shell.
+Opening Nexus again, or another folder with it, reuses the copy that is
+already running.
+
 ## Updates
 
 Nexus checks for a newer release shortly after it starts and every six hours
 after that, downloads it in the background, and shows **Restart to update** in
 the title bar once it is ready. Nothing is replaced until you click it; the
 restart brings your windows, layouts and chats back. **Nexus → Check for
-Updates…** checks on demand. Set `NEXUS_NO_UPDATE_CHECK=1` to turn the
-automatic check off.
+Updates…** checks on demand (on Windows it is in the menu at the left of the
+title bar). Set `NEXUS_NO_UPDATE_CHECK=1` to turn the automatic check off.
 
 ## Build from source
 
@@ -89,8 +108,17 @@ scripts/bundle.sh --install         # build Nexus.app and put it in /Application
 ```
 
 The Rust toolchain is pinned in `rust-toolchain.toml` (rustup installs it on
-first build). Only the Xcode Command Line Tools are needed: shaders are
-compiled at runtime, so full Xcode is not required.
+first build). On a Mac only the Xcode Command Line Tools are needed: shaders
+are compiled at runtime, so full Xcode is not required.
+
+On Windows, build with the MSVC toolchain and the Windows SDK (the "Desktop
+development with C++" workload of the Visual Studio Build Tools):
+
+```powershell
+cargo run --release                 # same as above
+scripts\bundle.ps1                  # build dist\Nexus.exe
+scripts\bundle.ps1 -Package         # also build the installer (needs Inno Setup 6)
+```
 
 ## Publishing a release
 
@@ -99,41 +127,49 @@ scripts/release.sh patch    # or minor, major, or an exact version like 0.4.2
 ```
 
 That bumps the version in `Cargo.toml`, commits, tags and pushes. The
-[release workflow](.github/workflows/release.yml) then runs the tests, builds
-a universal `Nexus.app`, and publishes it as a GitHub release: `Nexus.dmg` to
-download, plus `Nexus.zip` and `latest.json` for the updater. Installed copies
-find it on their next update check.
+[release workflow](.github/workflows/release.yml) then runs the tests and
+builds on both systems, and publishes one GitHub release: `Nexus.dmg` and
+`Nexus-Setup.exe` to download, plus `Nexus.zip` with `latest.json` and
+`Nexus.exe` with `latest-windows.json` for the updater. Installed copies find
+it on their next update check. Every push is also built and tested on both
+systems by the [CI workflow](.github/workflows/ci.yml).
 
 To sign with a Developer ID certificate instead of ad hoc, set
 `NEXUS_SIGN_IDENTITY` when running `scripts/bundle.sh`. The icon is drawn in
 `assets/icon.svg` and the disk image's backdrop in `assets/dmg-background.svg`;
-`scripts/make-icon.sh` rebuilds the images from them.
+`scripts/make-icon.sh` rebuilds the images from them, including `Nexus.ico`
+for Windows. The Windows installer is described in
+`scripts/windows/nexus.iss`.
 
 ## Keys
 
-| Key | Action |
-| --- | --- |
-| `⌘⇧N` | New window on the home view |
-| `⌘O` | Open a folder as a workspace |
-| `⌘T` | New terminal tab |
-| `⌘⇧C` / `⌘⇧X` | New Claude / Codex chat |
-| `⌘D` / `⌘⇧D` | Split right / down |
-| `⌘W` | Close tab (closes the pane with its last tab) |
-| `⌘]` / `⌘[` | Next / previous pane |
-| `⌃Tab` / `⌃⇧Tab` | Next / previous tab |
-| `⌘1`–`⌘9` | Jump to the nth terminal in the sidebar |
-| `⌘P` | Search chats (`↑`/`↓` to move, `Enter` to open, `Esc` to leave) |
-| `⌘F` | Find in the terminal or file (`Enter` / `⇧Enter` to step, `Esc` to close) |
-| `⌘G` / `⌘⇧G` | Next / previous match |
-| `⌘B` | Toggle the sidebar |
-| `⌘H` / `⌘M` | Hide Nexus / minimize the window |
-| `⌘`-click | Open the path or URL under the pointer |
-| Right-click a terminal | Split up / right / down / left, or close it |
-| Drag a tab | Reorder it, move it to another pane, or drop on a pane's edge to split |
-| Drag a file from the sidebar | Type its path into the terminal or chat it is dropped on |
-| `⌘C` / `⌘V` / `⌘K` | Copy selection / paste / clear the terminal |
-| `⇧PageUp` / `⇧PageDown` | Scroll back through terminal history |
-| `⇧Enter` | Insert a newline in an agent prompt |
+| macOS | Windows | Action |
+| --- | --- | --- |
+| `⌘⇧N` | `Ctrl+Shift+N` | New window on the home view |
+| `⌘O` | `Ctrl+Shift+O` | Open a folder as a workspace |
+| `⌘T` | `Ctrl+Shift+T` | New terminal tab |
+| `⌘⇧C` / `⌘⇧X` | `Alt+Shift+C` / `Alt+Shift+X` | New Claude / Codex chat |
+| `⌘D` / `⌘⇧D` | `Ctrl+Shift+D` / `Ctrl+Shift+E` | Split right / down |
+| `⌘W` | `Ctrl+Shift+W` | Close tab (closes the pane with its last tab) |
+| `⌘]` / `⌘[` | `Alt+→` / `Alt+←` | Next / previous pane |
+| `⌃Tab` / `⌃⇧Tab` | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
+| `⌘1`–`⌘9` | `Alt+1`–`Alt+9` | Jump to the nth terminal in the sidebar |
+| `⌘P` | `Ctrl+Shift+P` | Search chats (`↑`/`↓` to move, `Enter` to open, `Esc` to leave) |
+| `⌘F` | `Ctrl+Shift+F` | Find in the terminal or file (`Enter` / `⇧Enter` to step, `Esc` to close) |
+| `⌘G` / `⌘⇧G` | `F3` / `Shift+F3` | Next / previous match |
+| `⌘B` | `Ctrl+Shift+B` | Toggle the sidebar |
+| `⌘H` / `⌘M` | | Hide Nexus / minimize the window |
+| `⌘`-click | `Ctrl`-click | Open the path or URL under the pointer |
+| `⌘C` / `⌘V` / `⌘K` | `Ctrl+Shift+C` / `Ctrl+Shift+V` / `Ctrl+Shift+K` | Copy selection / paste / clear the terminal |
+| `⇧PageUp` / `⇧PageDown` | same | Scroll back through terminal history |
+| `⇧Enter` | same | Insert a newline in an agent prompt |
+| Right-click a terminal | same | Split up / right / down / left, or close it |
+| Drag a tab | same | Reorder it, move it to another pane, or drop on a pane's edge to split |
+| Drag a file from the sidebar | same | Type its path into the terminal or chat it is dropped on |
+
+On Windows the plain `Ctrl` keys (`Ctrl+C`, `Ctrl+D`, `Ctrl+R`…) go to the
+shell or agent in the terminal, which is why the app's own shortcuts add
+`Shift`. `Ctrl+V` and `Shift+Insert` also paste.
 
 Option acts as Meta in terminals (`⌥←`/`⌥→` move by word). Dropping files
 onto a terminal pastes their paths.
@@ -142,7 +178,7 @@ onto a terminal pastes their paths.
 
 | Module | Role |
 | --- | --- |
-| `terminal/` | PTY + VT emulation (`alacritty_terminal`), a custom GPUI element that paints the grid, key/mouse encoding, foreground-process detection |
+| `terminal/` | PTY + VT emulation (`alacritty_terminal`), a custom GPUI element that paints the grid, key/mouse encoding, which shell to run, foreground-process detection for each system |
 | `links.rs` | Finds file paths and URLs in a line of terminal text |
 | `sessions.rs` | Discovers Claude Code and Codex chats on disk |
 | `session_list.rs` | The searchable chat list |
@@ -155,7 +191,9 @@ onto a terminal pastes their paths.
 | `theme.rs`, `theme_picker.rs` | Color themes |
 | `find.rs` | The find bar and text matching |
 | `update.rs` | Finding, downloading and installing new releases |
-| `platform.rs` | Mac app plumbing: locale for shells, folders opened from Finder, the About panel |
+| `platform.rs` | What differs between macOS and Windows: where files live, shortcut spellings, starting and inspecting other programs |
+| `chrome.rs` | The window buttons and menu Windows leaves to the app |
+| `instance.rs` | One running copy per user on Windows; later copies hand over what they were asked to open |
 
 Performance choices worth knowing about:
 
@@ -166,7 +204,8 @@ Performance choices worth knowing about:
 - Every list (files, chats, file lines) is virtualized.
 - Chat logs can be hundreds of megabytes each, so only a bounded head and tail
   of each file is read, files are parsed in parallel, and results are cached by
-  path, modification time and size in `~/Library/Caches/nexus`.
+  path, modification time and size in `~/Library/Caches/nexus`
+  (`%LOCALAPPDATA%\Nexus\Cache` on Windows).
 - Directory listing, file loading and syntax highlighting all run off the UI
   thread; highlighting streams in chunk by chunk.
 
@@ -178,10 +217,11 @@ cargo test
 
 Unit tests cover the non-UI logic: path detection, key and mouse encoding,
 session-log parsing, chat filtering, line diffing, the pane layout tree,
-saved-state round trips, theme contrast, find matching, version comparison
-and swapping the app bundle during an update.
+saved-state round trips, theme contrast, find matching, version comparison,
+swapping the app during an update, shell arguments and quoting, and the
+hand-over between two copies of the app. They run on macOS and Windows.
 
 ## Not yet
 
 - The file view is read-only and has no text selection.
-- macOS only.
+- No Linux build.

@@ -97,7 +97,7 @@ fn find_url(line: &[char], start: usize, end: usize, index: usize) -> Option<Lin
     let url: String = line[url_start..url_end].iter().collect();
     let target = match url.strip_prefix("file://") {
         Some(path) => LinkTarget::File {
-            path: PathBuf::from(percent_decode(path)),
+            path: crate::platform::local_path(&percent_decode(path), cfg!(windows)),
             is_dir: false,
             line: None,
             column: None,
@@ -216,9 +216,17 @@ fn resolve(candidate: &str, bases: &[PathBuf], probe: Probe) -> Option<(PathBuf,
     if let Some(rest) = trimmed.strip_prefix("./") {
         variants.push(rest);
     }
+    if cfg!(windows) {
+        if let Some(rest) = trimmed.strip_prefix(".\\") {
+            variants.push(rest);
+        }
+    }
 
     for variant in variants {
-        if let Some(rest) = variant.strip_prefix("~/") {
+        let in_home = variant
+            .strip_prefix("~/")
+            .or_else(|| cfg!(windows).then(|| variant.strip_prefix("~\\")).flatten());
+        if let Some(rest) = in_home {
             if let Some(home) = home_dir() {
                 let path = home.join(rest);
                 if let Some(is_dir) = probe(&path) {
@@ -306,9 +314,7 @@ fn parse_position(rest: &[char]) -> (Option<u32>, Option<u32>, usize) {
     }
 }
 
-pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
+pub use crate::platform::home_dir;
 
 /// Lexically removes `.` and `..` so the same file always maps to one tab.
 pub fn normalize(path: &Path) -> PathBuf {

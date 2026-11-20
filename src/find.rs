@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use crate::assets::icon;
+use crate::platform::keys;
 use crate::text_input::{self, TextInput, TextInputEvent};
 use crate::theme;
 
@@ -16,9 +17,9 @@ actions!(find, [Find, FindNext, FindPrevious]);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("cmd-f", Find, None),
-        KeyBinding::new("cmd-g", FindNext, None),
-        KeyBinding::new("cmd-shift-g", FindPrevious, None),
+        KeyBinding::new(keys("cmd-f", "ctrl-shift-f"), Find, None),
+        KeyBinding::new(keys("cmd-g", "f3"), FindNext, None),
+        KeyBinding::new(keys("cmd-shift-g", "shift-f3"), FindPrevious, None),
         KeyBinding::new("shift-enter", FindPrevious, Some("FindBar")),
     ]);
 }

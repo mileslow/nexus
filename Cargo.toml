@@ -10,13 +10,30 @@ gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 alacritty_terminal = "0.26"
 anyhow = "1"
 futures = "0.3"
-libc = "0.2"
-# Already part of GPUI; used for the About panel.
-objc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-default-fancy"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Already part of GPUI; used for the About panel.
+objc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Already part of the terminal backend; used to inspect running processes.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Already part of GPUI; puts the icon and version into Nexus.exe.
+embed-resource = "3"
 
 [profile.dev]
 debug = false

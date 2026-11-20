@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Give up on an optimal diff past this many edits and show the changed
 /// region as one replaced block instead; keeps huge rewrites cheap.
@@ -257,7 +257,7 @@ pub struct GitState {
 }
 
 fn git(directory: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = Command::new("git")
+    let output = crate::platform::command("git")
         .arg("-C")
         .arg(directory)
         .args(args)
@@ -300,6 +300,7 @@ pub fn git_state(path: &Path) -> GitState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn kinds(diff: &Diff) -> String {
         diff.rows

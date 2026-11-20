@@ -74,6 +74,21 @@ const ICONS: &[(&str, &str)] = &[
     ("plus", icon_svg!(r#"<path d="M8 3v10M3 8h10"/>"#)),
     ("close", icon_svg!(r#"<path d="M4 4l8 8M12 4l-8 8"/>"#)),
     (
+        "menu",
+        icon_svg!(r#"<path d="M2.500 4.500h11M2.500 8h11M2.500 11.500h11"/>"#),
+    ),
+    ("window-minimize", icon_svg!(r#"<path d="M3 8h10"/>"#)),
+    (
+        "window-maximize",
+        icon_svg!(r#"<rect x="3.500" y="3.500" width="9" height="9" rx="1"/>"#),
+    ),
+    (
+        "window-restore",
+        icon_svg!(
+            r#"<rect x="3" y="5.500" width="7.500" height="7.500" rx="1"/><path d="M5.500 5.500V4a1 1 0 0 1 1-1H12a1 1 0 0 1 1 1v5.500a1 1 0 0 1-1 1h-1.500"/>"#
+        ),
+    ),
+    (
         "split-right",
         icon_svg!(
             r#"<rect x="1.6" y="2.6" width="12.8" height="10.8" rx="1.6"/><path d="M8 2.6v10.8"/>"#

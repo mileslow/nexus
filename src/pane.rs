@@ -665,11 +665,10 @@ impl Render for Pane {
                 .gap(px(6.))
                 .text_color(theme::text_faint())
                 .child("No open tabs")
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .child("⌘T new terminal · click a file or chat in the sidebar"),
-                )
+                .child(div().text_size(px(11.5)).child(crate::platform::keys(
+                    "⌘T new terminal · click a file or chat in the sidebar",
+                    "Ctrl+Shift+T new terminal · click a file or chat in the sidebar",
+                )))
                 .into_any_element(),
         };
 

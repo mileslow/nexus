@@ -57,8 +57,8 @@ impl Session {
 
     pub fn project_name(&self) -> &str {
         self.cwd
-            .trim_end_matches('/')
-            .rsplit('/')
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
             .next()
             .filter(|name| !name.is_empty())
             .unwrap_or("/")
@@ -83,16 +83,9 @@ pub fn resume_command(agent: Agent, id: &str) -> String {
     }
 }
 
+/// Quotes `text` for the shell terminals start.
 pub fn shell_quote(text: &str) -> String {
-    if !text.is_empty()
-        && text
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
-    {
-        text.to_string()
-    } else {
-        format!("'{}'", text.replace('\'', r"'\''"))
-    }
+    crate::terminal::shell::quote_for_default_shell(text)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -118,7 +111,7 @@ struct Candidate {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    Some(home_dir()?.join("Library/Caches/nexus/sessions.json"))
+    Some(crate::platform::cache_dir()?.join("sessions.json"))
 }
 
 fn load_cache() -> HashMap<PathBuf, CacheEntry> {
@@ -622,8 +615,7 @@ pub fn live_claude_sessions() -> HashMap<i32, String> {
         else {
             continue;
         };
-        // Signal 0 only asks whether the process exists.
-        if unsafe { libc::kill(pid, 0) } == 0 {
+        if crate::platform::process_alive(pid) {
             live.insert(pid, id);
         }
     }
@@ -749,7 +741,6 @@ mod tests {
         };
         assert_eq!(session.resume_command(), "claude --resume abc-123");
         assert_eq!(session.project_name(), "proj");
-        assert_eq!(shell_quote("it's; rm"), r"'it'\''s; rm'");
     }
 
     #[test]

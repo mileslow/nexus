@@ -10,6 +10,7 @@ use gpui::{
     TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 
+use crate::platform::keys;
 use crate::theme;
 
 actions!(
@@ -44,23 +45,26 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("right", Right, ctx),
         KeyBinding::new("shift-left", SelectLeft, ctx),
         KeyBinding::new("shift-right", SelectRight, ctx),
-        KeyBinding::new("cmd-a", SelectAll, ctx),
-        KeyBinding::new("cmd-v", Paste, ctx),
-        KeyBinding::new("cmd-c", Copy, ctx),
-        KeyBinding::new("cmd-x", Cut, ctx),
+        KeyBinding::new(keys("cmd-a", "ctrl-a"), SelectAll, ctx),
+        KeyBinding::new(keys("cmd-v", "ctrl-v"), Paste, ctx),
+        KeyBinding::new(keys("cmd-c", "ctrl-c"), Copy, ctx),
+        KeyBinding::new(keys("cmd-x", "ctrl-x"), Cut, ctx),
         KeyBinding::new("home", Home, ctx),
         KeyBinding::new("end", End, ctx),
-        KeyBinding::new("cmd-left", Home, ctx),
-        KeyBinding::new("cmd-right", End, ctx),
-        KeyBinding::new("ctrl-a", Home, ctx),
+        KeyBinding::new(keys("cmd-left", "ctrl-left"), Home, ctx),
+        KeyBinding::new(keys("cmd-right", "ctrl-right"), End, ctx),
         KeyBinding::new("ctrl-e", End, ctx),
-        KeyBinding::new("cmd-backspace", DeleteToStart, ctx),
+        KeyBinding::new(keys("cmd-backspace", "ctrl-backspace"), DeleteToStart, ctx),
         KeyBinding::new("ctrl-u", DeleteToStart, ctx),
         KeyBinding::new("enter", Submit, ctx),
         KeyBinding::new("escape", Cancel, ctx),
         KeyBinding::new("down", MoveDown, ctx),
         KeyBinding::new("up", MoveUp, ctx),
     ]);
+    if cfg!(target_os = "macos") {
+        // The Mac's Emacs-style line start; on Windows Ctrl+A selects all.
+        cx.bind_keys([KeyBinding::new("ctrl-a", Home, ctx)]);
+    }
 }
 
 pub enum TextInputEvent {

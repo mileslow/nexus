@@ -1,9 +1,11 @@
 //! Self-update. Looks for a newer release on GitHub, downloads it in the
-//! background, and swaps the app bundle when the user chooses to restart.
+//! background, and swaps it in when the user chooses to restart.
 //!
-//! Every release publishes `Nexus.zip` (the app) and `latest.json` (its
-//! version and checksum). The work is done by tools that ship with macOS:
-//! `curl`, `shasum`, `ditto`, `plutil` and `codesign`.
+//! Every release publishes the app and a small manifest with its version
+//! and checksum: `Nexus.zip` and `latest.json` for the Mac, `Nexus.exe` and
+//! `latest-windows.json` for Windows. The work is done by tools that ship
+//! with the system: `curl` on both, `shasum`, `ditto`, `plutil` and
+//! `codesign` on a Mac, `certutil` on Windows.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,12 +17,24 @@ use gpui::{div, prelude::*, px, App, Context, Entity, Global, Hsla, SharedString
 use serde::Deserialize;
 
 use crate::assets::icon;
-use crate::links::home_dir;
+use crate::platform;
 use crate::theme;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RELEASES_URL: &str = "https://github.com/mileslow/nexus/releases/latest";
-const MANIFEST_URL: &str = "https://github.com/mileslow/nexus/releases/latest/download/latest.json";
+const MANIFEST_URL: &str = if cfg!(windows) {
+    "https://github.com/mileslow/nexus/releases/latest/download/latest-windows.json"
+} else {
+    "https://github.com/mileslow/nexus/releases/latest/download/latest.json"
+};
+const CURL: &str = if cfg!(windows) {
+    "curl.exe"
+} else {
+    "/usr/bin/curl"
+};
+/// Names the process a freshly updated copy waits for before starting.
+#[cfg(windows)]
+const WAIT_FOR_PID: &str = "NEXUS_WAIT_FOR_PID";
 
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(8);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -57,6 +71,7 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 }
 
 /// The `.app` bundle an executable lives in, if it lives in one.
+#[cfg(any(target_os = "macos", test))]
 pub fn bundle_of(exe: &Path) -> Option<PathBuf> {
     let macos = exe.parent()?;
     let contents = macos.parent()?;
@@ -67,13 +82,29 @@ pub fn bundle_of(exe: &Path) -> Option<PathBuf> {
     bundled.then(|| bundle.to_path_buf())
 }
 
-fn running_bundle() -> Option<PathBuf> {
-    bundle_of(&std::env::current_exe().ok()?.canonicalize().ok()?)
+/// True for a program built by `cargo`, which is not an installed copy.
+#[cfg(any(windows, test))]
+pub fn is_cargo_build(exe: &Path) -> bool {
+    exe.parent()
+        .and_then(Path::file_name)
+        .is_some_and(|folder| folder == "debug" || folder == "release" || folder == "deps")
+}
+
+/// What an update replaces: the app bundle on a Mac, `Nexus.exe` on
+/// Windows. A build run straight from `cargo` has neither.
+fn installed() -> Option<PathBuf> {
+    let exe = platform::canonical(&std::env::current_exe().ok()?)?;
+    #[cfg(target_os = "macos")]
+    return bundle_of(&exe);
+    #[cfg(windows)]
+    return (!is_cargo_build(&exe)).then_some(exe);
+    #[cfg(not(any(target_os = "macos", windows)))]
+    return None;
 }
 
 /// Runs a tool and returns what it printed, or an error naming what failed.
 fn run(program: &str, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new(program)
+    let output = platform::command(program)
         .args(args)
         .stdin(Stdio::null())
         .output()
@@ -87,11 +118,18 @@ fn run(program: &str, args: &[&str]) -> Result<Vec<u8>> {
 }
 
 fn fetch_manifest(url: &str) -> Result<Manifest> {
-    let body = run("/usr/bin/curl", &["-fsSL", "--max-time", "20", url])
+    let body = run(CURL, &["-fsSL", "--max-time", "20", url])
         .context("could not reach the release server")?;
     serde_json::from_slice(&body).context("the release information was not understood")
 }
 
+fn download(url: &str, to: &Path) -> Result<()> {
+    let to = to.to_string_lossy();
+    run(CURL, &["-fsSL", "--max-time", "900", "-o", &to, url]).context("the download failed")?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn sha256_of(path: &Path) -> Result<String> {
     let path = path.to_string_lossy();
     let output = run("/usr/bin/shasum", &["-a", "256", &path])?;
@@ -102,6 +140,25 @@ fn sha256_of(path: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("shasum printed nothing"))
 }
 
+#[cfg(windows)]
+fn sha256_of(path: &Path) -> Result<String> {
+    let path = path.to_string_lossy();
+    let output = run("certutil.exe", &["-hashfile", &path, "SHA256"])?;
+    hash_from_certutil(&String::from_utf8_lossy(&output))
+        .ok_or_else(|| anyhow!("certutil printed no checksum"))
+}
+
+/// The checksum in what `certutil -hashfile` prints: the one line that is
+/// 64 hex digits. Older systems put spaces between the bytes.
+#[cfg(any(windows, test))]
+fn hash_from_certutil(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(|line| line.replace(' ', "").trim().to_lowercase())
+        .find(|line| line.len() == 64 && line.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+#[cfg(target_os = "macos")]
 fn bundle_version(app: &Path) -> Result<String> {
     let plist = app.join("Contents/Info.plist");
     let output = run(
@@ -119,22 +176,12 @@ fn bundle_version(app: &Path) -> Result<String> {
 }
 
 /// Downloads the release into `dir`, checks it, and returns the unpacked app.
+#[cfg(target_os = "macos")]
 fn stage(manifest: &Manifest, dir: &Path) -> Result<PathBuf> {
     let _ = fs::remove_dir_all(dir);
     fs::create_dir_all(dir)?;
     let zip = dir.join("Nexus.zip");
-    run(
-        "/usr/bin/curl",
-        &[
-            "-fsSL",
-            "--max-time",
-            "900",
-            "-o",
-            &zip.to_string_lossy(),
-            &manifest.url,
-        ],
-    )
-    .context("the download failed")?;
+    download(&manifest.url, &zip)?;
     ensure!(
         sha256_of(&zip)? == manifest.sha256.trim().to_lowercase(),
         "the download did not match its checksum"
@@ -171,44 +218,90 @@ fn stage(manifest: &Manifest, dir: &Path) -> Result<PathBuf> {
     Ok(app)
 }
 
-/// Moves a folder, copying when it has to cross to another volume.
-fn move_dir(from: &Path, to: &Path) -> Result<()> {
+/// Downloads the release into `dir`, checks it, and returns the new program.
+#[cfg(windows)]
+fn stage(manifest: &Manifest, dir: &Path) -> Result<PathBuf> {
+    let _ = fs::remove_dir_all(dir);
+    fs::create_dir_all(dir)?;
+    let exe = dir.join("Nexus.exe");
+    download(&manifest.url, &exe)?;
+    ensure!(
+        sha256_of(&exe)? == manifest.sha256.trim().to_lowercase(),
+        "the download did not match its checksum"
+    );
+    // Asking for its version shows that it runs, and a release stamped with
+    // the wrong version would be offered forever.
+    let output =
+        run(&exe.to_string_lossy(), &["--version"]).context("the downloaded app does not run")?;
+    let output = String::from_utf8_lossy(&output);
+    let version = output.split_whitespace().last().unwrap_or("");
+    ensure!(
+        version == manifest.version,
+        "the download is version {version}, not {}",
+        manifest.version
+    );
+    Ok(exe)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn stage(_manifest: &Manifest, _dir: &Path) -> Result<PathBuf> {
+    bail!("this system cannot update itself")
+}
+
+fn remove(path: &Path) {
+    let _ = if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+}
+
+/// Moves an app into place, copying when it has to cross to another volume.
+fn move_into_place(from: &Path, to: &Path) -> Result<()> {
     if fs::rename(from, to).is_ok() {
         return Ok(());
     }
+    #[cfg(not(windows))]
     run(
         "/usr/bin/ditto",
         &[&from.to_string_lossy(), &to.to_string_lossy()],
     )?;
-    let _ = fs::remove_dir_all(from);
+    #[cfg(windows)]
+    fs::copy(from, to)?;
+    remove(from);
     Ok(())
 }
 
-/// Puts the app at `staged` where `bundle` is. The old app stays beside it
-/// until the new one is in place, and comes back if anything goes wrong.
-pub fn swap(staged: &Path, bundle: &Path) -> Result<()> {
-    let name = bundle
-        .file_name()
-        .ok_or_else(|| anyhow!("the app has no name"))?
-        .to_string_lossy();
-    let backup = bundle.with_file_name(format!(".{name}.previous"));
-    let _ = fs::remove_dir_all(&backup);
-    fs::rename(bundle, &backup).with_context(|| {
+/// Where the app being replaced waits until the new one is in place.
+fn backup_of(installed: &Path) -> Option<PathBuf> {
+    let name = installed.file_name()?.to_string_lossy();
+    Some(installed.with_file_name(format!(".{name}.previous")))
+}
+
+/// Puts the app at `staged` where `installed` is. The old app stays beside
+/// it until the new one is in place, and comes back if anything goes wrong.
+pub fn swap(staged: &Path, installed: &Path) -> Result<()> {
+    let backup = backup_of(installed).ok_or_else(|| anyhow!("the app has no name"))?;
+    remove(&backup);
+    fs::rename(installed, &backup).with_context(|| {
         format!(
             "could not replace {} (is its folder writable?)",
-            bundle.display()
+            installed.display()
         )
     })?;
-    if let Err(error) = move_dir(staged, bundle) {
-        let _ = fs::remove_dir_all(bundle);
-        let _ = fs::rename(&backup, bundle);
+    if let Err(error) = move_into_place(staged, installed) {
+        remove(installed);
+        let _ = fs::rename(&backup, installed);
         return Err(error.context("could not put the new version in place"));
     }
-    let _ = fs::remove_dir_all(&backup);
+    // Windows keeps a running program's file until it exits; that copy is
+    // cleared away the next time the app starts.
+    remove(&backup);
     Ok(())
 }
 
 /// Opens `bundle` once this process has exited.
+#[cfg(unix)]
 fn relaunch_after_exit(bundle: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     let script = r#"while kill -0 "$0" 2>/dev/null; do sleep 0.1; done; open "$1""#;
@@ -224,6 +317,32 @@ fn relaunch_after_exit(bundle: &Path) -> Result<()> {
         .spawn()
         .context("could not schedule the restart")?;
     Ok(())
+}
+
+/// Starts the new program, which waits for this one to exit first.
+#[cfg(windows)]
+fn relaunch_after_exit(exe: &Path) -> Result<()> {
+    Command::new(exe)
+        .env(WAIT_FOR_PID, std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("could not schedule the restart")?;
+    Ok(())
+}
+
+/// Called first thing at launch. A copy started by an update waits for the
+/// copy it replaces to exit, so the two never run side by side.
+pub fn wait_for_previous() {
+    #[cfg(windows)]
+    if let Some(pid) = std::env::var(WAIT_FOR_PID)
+        .ok()
+        .and_then(|pid| pid.parse().ok())
+    {
+        std::env::remove_var(WAIT_FOR_PID);
+        platform::wait_for_exit(pid, Duration::from_secs(15));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -244,9 +363,9 @@ pub enum Status {
 
 pub struct Updater {
     status: Status,
-    /// The app bundle this process runs from. Builds run straight from
-    /// `cargo` have none, and only point at the release page.
-    bundle: Option<PathBuf>,
+    /// What an update replaces. Builds run straight from `cargo` have
+    /// nothing to replace, and only point at the release page.
+    installed: Option<PathBuf>,
     manifest_url: String,
     work: Option<Task<()>>,
     notice: Option<Task<()>>,
@@ -259,15 +378,19 @@ impl Global for GlobalUpdater {}
 impl Updater {
     /// Creates the app-wide updater and starts checking in the background.
     pub fn init(cx: &mut App) {
-        let bundle = running_bundle();
+        let installed = installed();
+        // What is left of the copy the last update replaced.
+        if let Some(backup) = installed.as_deref().and_then(backup_of) {
+            remove(&backup);
+        }
         // `NEXUS_UPDATE_MANIFEST` points at a different `latest.json`, for
         // trying a release before publishing it.
         let manifest_url =
             std::env::var("NEXUS_UPDATE_MANIFEST").unwrap_or_else(|_| MANIFEST_URL.to_string());
-        let automatic = bundle.is_some() && std::env::var_os("NEXUS_NO_UPDATE_CHECK").is_none();
+        let automatic = installed.is_some() && std::env::var_os("NEXUS_NO_UPDATE_CHECK").is_none();
         let updater = cx.new(|_| Updater {
             status: Status::Idle,
-            bundle,
+            installed,
             manifest_url,
             work: None,
             notice: None,
@@ -321,7 +444,7 @@ impl Updater {
             self.set_status(Status::Checking, cx);
         }
         let url = self.manifest_url.clone();
-        let can_install = self.bundle.is_some();
+        let can_install = self.installed.is_some();
         self.work = Some(cx.spawn(async move |this, cx| {
             let fetched = cx
                 .background_spawn(async move { fetch_manifest(&url) })
@@ -365,9 +488,9 @@ impl Updater {
             });
             let staged = cx
                 .background_spawn(async move {
-                    let dir = home_dir()
-                        .ok_or_else(|| anyhow!("no home folder"))?
-                        .join("Library/Caches/nexus/update");
+                    let dir = platform::cache_dir()
+                        .ok_or_else(|| anyhow!("no cache folder"))?
+                        .join("update");
                     stage(&manifest, &dir)
                 })
                 .await;
@@ -384,12 +507,12 @@ impl Updater {
 
     /// Installs the downloaded release and restarts into it.
     fn restart_to_update(&mut self, cx: &mut Context<Self>) {
-        let (Status::Ready { staged, .. }, Some(bundle)) =
-            (self.status.clone(), self.bundle.clone())
+        let (Status::Ready { staged, .. }, Some(installed)) =
+            (self.status.clone(), self.installed.clone())
         else {
             return;
         };
-        match swap(&staged, &bundle).and_then(|()| relaunch_after_exit(&bundle)) {
+        match swap(&staged, &installed).and_then(|()| relaunch_after_exit(&installed)) {
             Ok(()) => cx.quit(),
             Err(error) => self.set_status(Status::Failed(format!("{error:#}")), cx),
         }
@@ -463,6 +586,7 @@ impl Render for UpdateBadge {
         let updater = self.updater.clone();
         div()
             .id("update-badge")
+            .occlude()
             .flex_none()
             .max_w(px(420.))
             .h(px(22.))
@@ -517,6 +641,55 @@ mod tests {
         );
         assert_eq!(bundle_of(Path::new("/work/target/release/nexus")), None);
         assert_eq!(bundle_of(Path::new("/x/MacOS/Contents/MacOS/nexus")), None);
+    }
+
+    #[test]
+    fn cargo_builds_are_not_installed_copies() {
+        assert!(is_cargo_build(Path::new("/work/target/debug/nexus.exe")));
+        assert!(is_cargo_build(Path::new("/work/target/release/nexus.exe")));
+        assert!(!is_cargo_build(Path::new("/Programs/Nexus/Nexus.exe")));
+    }
+
+    #[test]
+    fn reads_the_checksum_certutil_prints() {
+        let hash = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let modern = format!(
+            "SHA256 hash of Nexus.exe:\r\n{hash}\r\nCertUtil: -hashfile command completed successfully.\r\n"
+        );
+        assert_eq!(hash_from_certutil(&modern).as_deref(), Some(hash));
+        let spaced: String = hash
+            .as_bytes()
+            .chunks(2)
+            .map(|pair| std::str::from_utf8(pair).unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let older = format!(
+            "SHA256 hash of file Nexus.exe:\n{}\nCertUtil: done\n",
+            spaced.to_uppercase()
+        );
+        assert_eq!(hash_from_certutil(&older).as_deref(), Some(hash));
+        assert_eq!(
+            hash_from_certutil("CertUtil: -hashfile command FAILED"),
+            None
+        );
+    }
+
+    #[test]
+    fn swapping_a_single_program_works_like_swapping_an_app() {
+        let dir = scratch("swap-file");
+        let installed = dir.join("Programs/Nexus.exe");
+        let staged = dir.join("cache/Nexus.exe");
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::write(&installed, "old").unwrap();
+        fs::write(&staged, "new").unwrap();
+
+        swap(&staged, &installed).unwrap();
+
+        assert_eq!(fs::read_to_string(&installed).unwrap(), "new");
+        assert!(!staged.exists());
+        assert!(!backup_of(&installed).unwrap().exists());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

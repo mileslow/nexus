@@ -90,6 +90,7 @@ impl Render for ThemePicker {
             .child(
                 div()
                     .id("theme-button")
+                    .occlude()
                     .size(px(24.))
                     .flex()
                     .items_center()

@@ -1,5 +1,6 @@
-# Builds Nexus.app and publishes it as a GitHub release whenever a version
-# tag is pushed. `scripts/release.sh` pushes that tag.
+# Builds Nexus for the Mac and for Windows and publishes both as a GitHub
+# release whenever a version tag is pushed. `scripts/release.sh` pushes
+# that tag.
 name: Release
 
 on:
@@ -10,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  mac:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
@@ -22,7 +23,6 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
             exit 1
           fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Test
         run: cargo test --release --target aarch64-apple-darwin
@@ -30,9 +30,55 @@ jobs:
       - name: Build and package
         run: scripts/bundle.sh --universal --package
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: |
+            dist/Nexus.dmg
+            dist/Nexus.zip
+            dist/latest.json
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build and package
+        run: scripts\bundle.ps1 -Package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/Nexus-Setup.exe
+            dist/Nexus.exe
+            dist/latest-windows.json
+          if-no-files-found: error
+
+  # Both systems publish together, so a release never has one without the
+  # other and no copy of the app is offered an update it cannot download.
+  publish:
+    needs: [mac, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/Nexus.dmg dist/Nexus.zip dist/latest.json \
-            --title "Nexus $VERSION" --generate-notes
+          gh release create "$GITHUB_REF_NAME" \
+            dist/Nexus.dmg dist/Nexus.zip dist/latest.json \
+            dist/Nexus-Setup.exe dist/Nexus.exe dist/latest-windows.json \
+            --title "Nexus ${GITHUB_REF_NAME#v}" --generate-notes

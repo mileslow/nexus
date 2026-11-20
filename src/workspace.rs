@@ -9,11 +9,12 @@ use gpui::{
     actions, anchored, deferred, div, prelude::*, px, relative, AnyElement, App, Axis, Context,
     DragMoveEvent, EmptyView, Entity, EntityId, FocusHandle, Focusable, FontWeight, KeyDownEvent,
     MouseButton, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString, Task, WeakEntity,
-    Window,
+    Window, WindowControlArea,
 };
 
 use crate::app_state::{SavedAxis, SavedChat, SavedLayout, SavedNode, SavedTab, Store};
 use crate::assets::icon;
+use crate::chrome::{self, AppMenu};
 use crate::file_tree::{FileTree, FileTreeEvent};
 use crate::file_view::FileView;
 use crate::find::{Find, FindNext, FindPrevious};
@@ -104,6 +105,7 @@ pub struct Workspace {
     terminal_menu: Option<TerminalMenu>,
     theme_picker: Entity<ThemePicker>,
     update_badge: Entity<UpdateBadge>,
+    app_menu: Entity<AppMenu>,
     ticks: usize,
     _tick: Task<()>,
 }
@@ -189,6 +191,7 @@ impl Workspace {
             terminal_menu: None,
             theme_picker: cx.new(|_| ThemePicker::new()),
             update_badge: cx.new(UpdateBadge::new),
+            app_menu: cx.new(|_| AppMenu::new()),
             ticks: 0,
             _tick: tick,
         };
@@ -1325,6 +1328,7 @@ impl Workspace {
     ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
+            .occlude()
             .h(px(24.))
             .px(px(8.))
             .flex()
@@ -1348,7 +1352,11 @@ impl Workspace {
 
     fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         // Leave room for the traffic lights unless the window is full screen.
-        let leading = if window.is_fullscreen() { 10. } else { 80. };
+        let leading = if window.is_fullscreen() || chrome::CUSTOM {
+            10.
+        } else {
+            80.
+        };
         let root_path: SharedString = display_path(&self.root).into();
         div()
             .id("titlebar")
@@ -1358,7 +1366,7 @@ impl Workspace {
             .items_center()
             .gap(px(8.))
             .pl(px(leading))
-            .pr(px(10.))
+            .when(!chrome::CUSTOM, |bar| bar.pr(px(10.)))
             .bg(theme::bg_titlebar())
             .border_b_1()
             .border_color(theme::border())
@@ -1367,12 +1375,19 @@ impl Workspace {
                     window.titlebar_double_click();
                 }
             })
-            .child(icon_button("toggle-sidebar", "sidebar").on_click(
+            // Windows moves the window by the bar; everything on it that
+            // takes clicks occludes it.
+            .when(chrome::CUSTOM, |bar| {
+                bar.window_control_area(WindowControlArea::Drag)
+                    .child(self.app_menu.clone())
+            })
+            .child(icon_button("toggle-sidebar", "sidebar").occlude().on_click(
                 cx.listener(|this, _, window, cx| this.toggle_sidebar(&ToggleSidebar, window, cx)),
             ))
             .child(
                 div()
                     .id("titlebar-root")
+                    .occlude()
                     .min_w_0()
                     .truncate()
                     .text_color(theme::text_muted())
@@ -1414,6 +1429,9 @@ impl Workspace {
                 })),
             )
             .child(self.theme_picker.clone())
+            .when(chrome::CUSTOM, |bar| {
+                bar.child(chrome::caption_buttons(window))
+            })
     }
 
     fn render_divider(

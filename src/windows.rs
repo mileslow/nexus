@@ -12,7 +12,7 @@ use crate::workspace::Workspace;
 
 /// Resolves symlinks so one folder is always one workspace.
 pub fn canonical(root: &Path) -> PathBuf {
-    root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+    crate::platform::canonical(root).unwrap_or_else(|| root.to_path_buf())
 }
 
 fn window_options(cx: &mut App) -> WindowOptions {
@@ -21,7 +21,15 @@ fn window_options(cx: &mut App) -> WindowOptions {
     let background = std::env::var_os("NEXUS_BACKGROUND").is_some_and(|value| value == "1");
     // Step each new window down and right so it does not hide the last one.
     let step = px(28. * (cx.windows().len() % 8) as f32);
-    let mut bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+    // Windows does not shrink a window to fit, so on a small screen the
+    // title bar would open above the top edge.
+    let mut wanted = size(px(1440.), px(900.));
+    if let Some(display) = cx.primary_display() {
+        let screen = display.bounds().size;
+        wanted.width = wanted.width.min(screen.width - px(48.)).max(px(640.));
+        wanted.height = wanted.height.min(screen.height - px(96.)).max(px(400.));
+    }
+    let mut bounds = Bounds::centered(None, wanted, cx);
     bounds.origin = bounds.origin + point(step, step);
     WindowOptions {
         focus: !background,

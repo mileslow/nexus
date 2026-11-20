@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gpui::{px, rgb, rgba, Hsla, Pixels, Rgba};
 
 pub const UI_FONT: &str = ".SystemUIFont";
-pub const MONO_FONT: &str = "Menlo";
+/// A monospaced font every copy of the system has.
+pub const MONO_FONT: &str = if cfg!(windows) { "Consolas" } else { "Menlo" };
 
 pub const UI_TEXT_SIZE: Pixels = px(12.5);
 pub const MONO_TEXT_SIZE: Pixels = px(12.5);

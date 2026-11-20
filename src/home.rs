@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     div, img, prelude::*, px, App, Context, Entity, FocusHandle, Focusable, FontWeight,
-    PathPromptOptions, SharedString, Window,
+    PathPromptOptions, SharedString, Window, WindowControlArea,
 };
 
 use crate::app_state::{Store, WorkspaceRecord};
 use crate::assets::{icon, logo};
-use crate::links::home_dir;
+use crate::chrome::{self, AppMenu};
+use crate::platform::{home_dir, keys};
 use crate::sessions::{format_age, now_secs};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme;
@@ -22,6 +23,7 @@ pub struct Home {
     search: Entity<TextInput>,
     theme_picker: Entity<ThemePicker>,
     update_badge: Entity<UpdateBadge>,
+    app_menu: Entity<AppMenu>,
     highlighted: usize,
 }
 
@@ -38,7 +40,7 @@ pub fn display_path(path: &Path) -> String {
             return if rest.as_os_str().is_empty() {
                 "~".to_string()
             } else {
-                format!("~/{}", rest.to_string_lossy())
+                format!("~{}{}", std::path::MAIN_SEPARATOR, rest.to_string_lossy())
             };
         }
     }
@@ -106,6 +108,7 @@ impl Home {
             search,
             theme_picker: cx.new(|_| ThemePicker::new()),
             update_badge: cx.new(UpdateBadge::new),
+            app_menu: cx.new(|_| AppMenu::new()),
             highlighted: 0,
         }
     }
@@ -295,16 +298,26 @@ impl Render for Home {
                     .flex_none()
                     .flex()
                     .items_center()
-                    .justify_end()
                     .gap(px(8.))
-                    .px(px(10.))
+                    .pl(px(10.))
+                    .when(!chrome::CUSTOM, |bar| bar.pr(px(10.)))
                     .on_click(|event, window, _| {
                         if event.click_count() == 2 {
                             window.titlebar_double_click();
                         }
                     })
+                    // Windows moves the window by the strip, and has no
+                    // menu bar or window buttons of its own here.
+                    .when(chrome::CUSTOM, |bar| {
+                        bar.window_control_area(WindowControlArea::Drag)
+                            .child(self.app_menu.clone())
+                    })
+                    .child(div().flex_1())
                     .child(self.update_badge.clone())
-                    .child(self.theme_picker.clone()),
+                    .child(self.theme_picker.clone())
+                    .when(chrome::CUSTOM, |bar| {
+                        bar.child(chrome::caption_buttons(window))
+                    }),
             )
             .child(
                 div().flex_1().min_h_0().flex().justify_center().child(
@@ -409,7 +422,10 @@ impl Render for Home {
                                         .text_size(px(11.5))
                                         .text_color(theme::text_faint())
                                         .child(
-                                        "⌘O open folder · ⌘⇧N new window · ↑↓ and Enter to pick",
+                                        keys(
+                                            "⌘O open folder · ⌘⇧N new window · ↑↓ and Enter to pick",
+                                            "Ctrl+Shift+O open folder · Ctrl+Shift+N new window · ↑↓ and Enter to pick",
+                                        ),
                                     ),
                                 ),
                         ),

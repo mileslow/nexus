@@ -3344,6 +3344,7 @@ version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "embed-resource",
  "futures",
  "gpui",
  "libc",
@@ -3352,6 +3353,7 @@ dependencies = [
  "serde_json",
  "syntect",
  "two-face",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

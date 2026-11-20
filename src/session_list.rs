@@ -12,6 +12,7 @@ use gpui::{
 
 use crate::app_state::SavedChat;
 use crate::assets::icon;
+use crate::platform::{folder_key, is_within};
 use crate::sessions::{self, Agent, Session};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme;
@@ -59,19 +60,15 @@ pub fn filter_sessions(
 ) -> Vec<usize> {
     let query = query.to_lowercase();
     let terms: Vec<&str> = query.split_whitespace().collect();
-    let under = under.map(|root| root.trim_end_matches('/'));
+    let under = under.map(|root| folder_key(root, cfg!(windows)));
     sessions
         .iter()
         .enumerate()
         .filter(|(_, session)| {
             agent.is_none_or(|agent| session.agent == agent)
-                && under.is_none_or(|root| {
-                    session.cwd == root
-                        || session
-                            .cwd
-                            .strip_prefix(root)
-                            .is_some_and(|rest| rest.starts_with('/'))
-                })
+                && under
+                    .as_deref()
+                    .is_none_or(|root| is_within(&folder_key(&session.cwd, cfg!(windows)), root))
                 && terms.iter().all(|term| session.haystack.contains(term))
         })
         .map(|(index, _)| index)
@@ -91,12 +88,12 @@ pub fn infer_chat(
     // Clocks and file timestamps are only this precise.
     const SLACK: u64 = 5;
     let cwd = cwd.to_string_lossy();
-    let cwd = cwd.trim_end_matches('/');
+    let cwd = folder_key(&cwd, cfg!(windows));
     sessions
         .iter()
         .filter(|session| {
             session.agent == agent
-                && session.cwd.trim_end_matches('/') == cwd
+                && folder_key(&session.cwd, cfg!(windows)) == cwd
                 && session.modified + SLACK >= agent_started
                 && !claimed.contains(&session.id)
         })

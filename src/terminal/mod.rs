@@ -4,11 +4,11 @@
 pub mod element;
 pub mod keys;
 mod proc;
+pub mod shell;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
-use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,6 +36,7 @@ use gpui::{
 use crate::file_tree::DraggedPath;
 use crate::find::{self, FindBar, FindEvent};
 use crate::links::{self, Link, LinkTarget};
+use crate::platform::keys;
 use crate::sessions::{shell_quote, Agent};
 use crate::theme;
 
@@ -43,11 +44,18 @@ actions!(terminal, [Copy, Paste, Clear]);
 
 pub fn bind_keys(cx: &mut App) {
     let ctx = Some("Terminal");
+    // On Windows plain Ctrl+C belongs to the program in the terminal.
     cx.bind_keys([
-        KeyBinding::new("cmd-c", Copy, ctx),
-        KeyBinding::new("cmd-v", Paste, ctx),
-        KeyBinding::new("cmd-k", Clear, ctx),
+        KeyBinding::new(keys("cmd-c", "ctrl-shift-c"), Copy, ctx),
+        KeyBinding::new(keys("cmd-v", "ctrl-shift-v"), Paste, ctx),
+        KeyBinding::new(keys("cmd-k", "ctrl-shift-k"), Clear, ctx),
     ]);
+    if cfg!(windows) {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-v", Paste, ctx),
+            KeyBinding::new("shift-insert", Paste, ctx),
+        ]);
+    }
 }
 
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -134,6 +142,13 @@ pub fn dropped_path_text(path: &std::path::Path, cwd: &std::path::Path, agent: b
     format!("{} ", shell_quote(&path.to_string_lossy()))
 }
 
+/// Windows shells title the terminal with the path of their own program
+/// (`Administrator: C:\\…\\pwsh.exe`), which says nothing. Titles worth
+/// showing come from what is run in them.
+fn is_program_path_title(title: &str) -> bool {
+    title.to_ascii_lowercase().ends_with(".exe")
+}
+
 /// A link under the pointer while Cmd is held.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HoveredLink {
@@ -166,8 +181,7 @@ pub struct TerminalView {
     pub session_id: Option<String>,
     initial_cwd: PathBuf,
     workspace_root: PathBuf,
-    child_pid: i32,
-    pty_fd: RawFd,
+    processes: proc::Watch,
     foreground_pid: i32,
     process_name: String,
     process_cwd: Option<PathBuf>,
@@ -210,28 +224,20 @@ impl Drop for TerminalView {
             // blocks on a full PTY while exiting, and it stops by itself once
             // the shell is gone. Stopping it first can leave the shell stuck
             // mid-exit for many seconds.
-            unsafe {
-                libc::kill(self.child_pid, libc::SIGHUP);
-            }
-            // Programs that ignore SIGHUP must not keep the reader alive forever.
+            self.processes.hang_up();
+            // Programs that ignore the hang-up must not keep the reader
+            // alive forever. On Windows closing the terminal is what ends
+            // them, so there is nothing to wait for.
+            let grace = if cfg!(windows) {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(3)
+            };
             let pty_tx = self.pty_tx.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(3));
+                std::thread::sleep(grace);
                 let _ = pty_tx.send(Msg::Shutdown);
             });
-        }
-        unsafe {
-            libc::close(self.pty_fd);
-        }
-    }
-}
-
-/// Marks a descriptor close-on-exec so shells started later do not inherit it.
-fn set_cloexec(fd: RawFd) {
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
         }
     }
 }
@@ -253,26 +259,15 @@ impl TerminalView {
             cell_height: 17,
         };
 
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|shell| !shell.is_empty())
-            .unwrap_or_else(|| "/bin/zsh".to_string());
-        let args = match &options.command {
-            // A login + interactive shell loads the user's PATH so agent CLIs
-            // resolve, and `exec` leaves a usable shell behind afterwards.
-            Some(command) => vec![
-                "-l".to_string(),
-                "-i".to_string(),
-                "-c".to_string(),
-                format!("{command}; exec {} -l -i", shell_quote(&shell)),
-            ],
-            None => vec!["-l".to_string()],
-        };
+        let shell = shell::program();
+        let args = shell::arguments(&shell, options.command.as_deref());
         let cwd = if options.cwd.is_dir() {
             options.cwd.clone()
         } else {
             links::home_dir().unwrap_or_else(|| PathBuf::from("/"))
         };
+        // Windows resolves folders to a spelling shells cannot start in.
+        let cwd = PathBuf::from(crate::platform::strip_verbatim(&cwd.to_string_lossy()));
         let mut env = HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
@@ -282,16 +277,14 @@ impl TerminalView {
             working_directory: Some(cwd.clone()),
             drain_on_exit: false,
             env,
+            #[cfg(windows)]
+            escape_args: true,
         };
 
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let pty = tty::new(&pty_options, window_size, id as u64)?;
-        let child_pid = pty.child().id() as i32;
-        // Without this every later terminal's shell would inherit this PTY's
-        // master side, keeping it open after its own tab is closed.
-        set_cloexec(pty.file().as_raw_fd());
-        // Our own handle on the PTY, used only to query its foreground process.
-        let pty_fd = unsafe { libc::fcntl(pty.file().as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        let processes = proc::Watch::new(&pty);
+        let child_pid = processes.shell_pid();
 
         let (tx, mut rx) = unbounded();
         let wake_pending = Arc::new(AtomicBool::new(false));
@@ -357,8 +350,7 @@ impl TerminalView {
                 session_id: options.session_id,
                 initial_cwd: cwd,
                 workspace_root: options.workspace_root,
-                child_pid,
-                pty_fd,
+                processes,
                 foreground_pid: child_pid,
                 process_name: String::new(),
                 process_cwd: None,
@@ -395,7 +387,7 @@ impl TerminalView {
             return label.clone();
         }
         if let Some(title) = self.osc_title.as_deref().map(str::trim) {
-            if !title.is_empty() {
+            if !title.is_empty() && !is_program_path_title(title) {
                 return title.to_string();
             }
         }
@@ -449,9 +441,9 @@ impl TerminalView {
         if self.exited {
             return false;
         }
-        let pid = proc::foreground_pid(self.pty_fd).unwrap_or(self.child_pid);
+        let pid = self.processes.foreground();
         let name = proc::process_name(pid).unwrap_or_default();
-        let cwd = proc::process_cwd(pid).or_else(|| proc::process_cwd(self.child_pid));
+        let cwd = proc::process_cwd(pid).or_else(|| proc::process_cwd(self.processes.shell_pid()));
         let mut changed = false;
         if pid != self.foreground_pid || name != self.process_name {
             self.foreground_pid = pid;
@@ -708,7 +700,7 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.modifiers.platform {
+        if event.modifiers.secondary() {
             let position = window.mouse_position();
             if self.bounds.contains(&position) {
                 let (point, _) = self.grid_point(position);
@@ -965,7 +957,7 @@ impl TerminalView {
         window.focus(&self.focus_handle);
         let (point, side) = self.grid_point(event.position);
 
-        if event.modifiers.platform {
+        if event.modifiers.secondary() {
             if let Some(link) = self.link_at(point) {
                 cx.emit(TerminalEvent::Open(link.target));
                 return;
@@ -1019,7 +1011,7 @@ impl TerminalView {
             }
         }
 
-        if event.modifiers.platform {
+        if event.modifiers.secondary() {
             let (point, _) = self.grid_point(event.position);
             if self.hover_cell != Some(point) {
                 self.hover_cell = Some(point);
@@ -1183,9 +1175,10 @@ impl TerminalView {
                             Some(0) | None => path,
                             Some(slash) => &path[slash..],
                         };
+                        let path = crate::platform::local_path(path, cfg!(windows));
                         LinkTarget::File {
-                            path: PathBuf::from(path),
-                            is_dir: std::path::Path::new(path).is_dir(),
+                            is_dir: path.is_dir(),
+                            path,
                             line: None,
                             column: None,
                         }
@@ -1279,6 +1272,16 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn a_shell_naming_its_own_program_is_not_a_title() {
+        assert!(is_program_path_title(
+            r"Administrator: C:\Program Files\PowerShell\7\pwsh.exe"
+        ));
+        assert!(is_program_path_title(r"C:\WINDOWS\system32\cmd.EXE"));
+        assert!(!is_program_path_title("✳ Fix the login bug"));
+        assert!(!is_program_path_title("vim notes.txt"));
+    }
+
+    #[test]
     fn find_queries_are_searched_as_plain_text() {
         assert_eq!(literal_pattern("main.rs"), r"main\.rs");
         assert_eq!(literal_pattern("f(x) [y]"), r"f\(x\) \[y\]");
@@ -1308,6 +1311,8 @@ mod tests {
             dropped_path_text(Path::new("/work/app/src/main.rs"), cwd, false),
             "/work/app/src/main.rs "
         );
+        // Quoting follows the shell terminals start; see `shell::quote`.
+        #[cfg(not(windows))]
         assert_eq!(
             dropped_path_text(Path::new("/work/it's here/a.txt"), cwd, false),
             r"'/work/it'\''s here/a.txt' "

@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use gpui::{AnyWindowHandle, Global};
 use serde::{Deserialize, Serialize};
 
-use crate::links::home_dir;
 use crate::sessions::{now_secs, Agent};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -208,13 +207,17 @@ pub struct Store {
 
 impl Global for Store {}
 
+/// Where remembered windows are kept. `NEXUS_STATE_FILE` points the app at
+/// a different file, so scripted runs never touch the real one.
+pub fn state_path() -> Option<PathBuf> {
+    std::env::var_os("NEXUS_STATE_FILE")
+        .map(PathBuf::from)
+        .or_else(|| Some(crate::platform::data_dir()?.join("state.json")))
+}
+
 impl Store {
     pub fn load() -> Self {
-        // `NEXUS_STATE_FILE` points the app at a different file, so scripted
-        // runs never touch the real one.
-        let path = std::env::var_os("NEXUS_STATE_FILE")
-            .map(PathBuf::from)
-            .or_else(|| Some(home_dir()?.join("Library/Application Support/Nexus/state.json")));
+        let path = state_path();
         let state = path
             .as_deref()
             .and_then(|path| fs::read(path).ok())
