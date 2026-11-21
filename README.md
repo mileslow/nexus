@@ -98,7 +98,7 @@ already running.
 
 ## Updates
 
-Nexus checks for a newer release shortly after it starts and every six hours
+Nexus checks for a newer release shortly after it starts and every ten minutes
 after that, downloads it in the background, and shows **Restart to update** in
 the title bar once it is ready. Nothing is replaced until you click it; the
 restart brings your windows, layouts and chats back. **Nexus → Check for

@@ -37,7 +37,8 @@ const CURL: &str = if cfg!(windows) {
 const WAIT_FOR_PID: &str = "NEXUS_WAIT_FOR_PID";
 
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(8);
-const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+/// Often enough that a release shows up in a running copy within minutes.
+const CHECK_EVERY: Duration = Duration::from_secs(10 * 60);
 /// How long "Up to date" and error messages stay in the title bar.
 const NOTICE_FOR: Duration = Duration::from_secs(6);
 
