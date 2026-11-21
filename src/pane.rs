@@ -5,7 +5,7 @@ use std::path::Path;
 
 use gpui::{
     div, prelude::*, px, AnyElement, App, Bounds, Context, DragMoveEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Point, Rgba, SharedString,
+    EventEmitter, FocusHandle, Focusable, MouseButton, MouseDownEvent, Pixels, Point, Rgba, SharedString,
     Subscription, Window,
 };
 
@@ -66,6 +66,11 @@ pub enum PaneEvent {
     NewTerminal,
     /// A terminal in this pane was right-clicked.
     ContextMenu {
+        position: Point<Pixels>,
+        item: EntityId,
+    },
+    /// A tab in this pane's header was right-clicked.
+    TabMenu {
         position: Point<Pixels>,
         item: EntityId,
     },
@@ -492,6 +497,7 @@ impl Pane {
             PaneItem::File(_) => ("file", theme::text_faint(), None),
         };
         let glyph = icon(glyph_name, px(13.), glyph_color);
+        let item_id = item.entity_id();
         let dragged = DraggedTab {
             pane: cx.entity_id(),
             item: item.entity_id(),
@@ -568,6 +574,17 @@ impl Pane {
                 MouseButton::Middle,
                 cx.listener(move |this, _, window, cx| this.close_item(index, window, cx)),
             )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |_, event: &MouseDownEvent, _, cx| {
+                    // Keep the strip behind from opening the active tab's menu.
+                    cx.stop_propagation();
+                    cx.emit(PaneEvent::TabMenu {
+                        position: event.position,
+                        item: item_id,
+                    });
+                }),
+            )
             // Tabs can be dragged to reorder them, onto another pane to move
             // them there, or onto a pane's edge to split it.
             .on_drag(dragged, |tab, _, _, cx| cx.new(|_| TabPreview(tab.clone())))
@@ -602,6 +619,19 @@ impl Pane {
                     .flex()
                     .overflow_x_scroll()
                     .children(tabs)
+                    // Right-clicking the empty part of the strip is about the
+                    // tab that is showing.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            if let Some(item) = this.active_item() {
+                                cx.emit(PaneEvent::TabMenu {
+                                    position: event.position,
+                                    item: item.entity_id(),
+                                });
+                            }
+                        }),
+                    )
                     // The empty part of the strip takes drops at the end.
                     .drag_over::<DraggedTab>(|style, _, _, _| style.bg(theme::bg_hover()))
                     .on_drop(cx.listener(|this, tab: &DraggedTab, window, cx| {

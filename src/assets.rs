@@ -80,6 +80,24 @@ const ICONS: &[(&str, &str)] = &[
         ),
     ),
     (
+        "bookmark",
+        icon_svg!(r#"<path d="M4.500 2.500h7v11L8 10.800 4.500 13.500z"/>"#),
+    ),
+    (
+        "bookmark-filled",
+        icon_svg!(r#"<path fill="black" d="M4.500 2.500h7v11L8 10.800 4.500 13.500z"/>"#),
+    ),
+    (
+        "pin",
+        icon_svg!(r#"<path d="M5.800 2.500h4.400L9.600 6.500l2.400 2.800H4l2.400-2.800zM8 9.300v4.200"/>"#),
+    ),
+    (
+        "pin-filled",
+        icon_svg!(
+            r#"<path fill="black" d="M5.800 2.500h4.400L9.600 6.500l2.400 2.800H4l2.400-2.800z"/><path d="M8 9.300v4.200"/>"#
+        ),
+    ),
+    (
         "menu",
         icon_svg!(r#"<path d="M2.500 4.500h11M2.500 8h11M2.500 11.500h11"/>"#),
     ),

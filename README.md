@@ -31,6 +31,11 @@ searchable list.
 - **Chats.** Claude Code and Codex sessions found on this machine, newest
   first, searchable by title or folder. Clicking one resumes it in the active
   pane, or focuses it if it is already open.
+- **Pins and bookmarks.** Point at a chat to pin it to the top of the list or
+  bookmark it; the bookmark button beside the filters narrows the list to
+  bookmarked chats. Right-click an agent's tab to do the same for the chat it
+  is running, or to bookmark it and close the tab in one step. Marks are
+  remembered and shared by every window.
 - **Files open where you expect.** A file picked in the sidebar opens as a
   tab in the focused pane. A path `⌘`-clicked in a terminal opens beside that
   terminal rather than on top of it, with the files already open.
@@ -165,6 +170,7 @@ for Windows. The Windows installer is described in
 | `⇧PageUp` / `⇧PageDown` | same | Scroll back through terminal history |
 | `⇧Enter` | same | Insert a newline in an agent prompt |
 | Right-click a terminal | same | Copy the selected text, split up / right / down / left, or close it |
+| Right-click a tab | same | Bookmark or pin the agent chat it runs, close it, or bookmark and close |
 | Drag a tab | same | Reorder it, move it to another pane, or drop on a pane's edge to split |
 | Drag a file from the sidebar | same | Type its path into the terminal or chat it is dropped on |
 

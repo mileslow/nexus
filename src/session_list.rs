@@ -1,6 +1,6 @@
 //! The searchable list of Claude Code and Codex chats.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +10,7 @@ use gpui::{
     ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window,
 };
 
-use crate::app_state::SavedChat;
+use crate::app_state::{ChatMarks, SavedChat, Store};
 use crate::assets::icon;
 use crate::platform::{folder_key, is_within};
 use crate::sessions::{self, Agent, Session};
@@ -35,6 +35,10 @@ pub struct SessionList {
     root: PathBuf,
     /// When set, only chats started under `root` are listed.
     scope_to_root: bool,
+    /// When set, only bookmarked chats are listed.
+    bookmarks_only: bool,
+    /// The pins and bookmarks the list was last arranged by.
+    marks: ChatMarks,
     highlighted: usize,
     open_ids: HashSet<String>,
     loaded: bool,
@@ -52,11 +56,13 @@ impl Focusable for SessionList {
 }
 
 /// Returns indices of sessions matching every whitespace-separated term.
+/// `among`, when given, limits the result to chats with those ids.
 pub fn filter_sessions(
     sessions: &[Session],
     query: &str,
     agent: Option<Agent>,
     under: Option<&str>,
+    among: Option<&BTreeSet<String>>,
 ) -> Vec<usize> {
     let query = query.to_lowercase();
     let terms: Vec<&str> = query.split_whitespace().collect();
@@ -66,6 +72,7 @@ pub fn filter_sessions(
         .enumerate()
         .filter(|(_, session)| {
             agent.is_none_or(|agent| session.agent == agent)
+                && among.is_none_or(|ids| ids.contains(&session.id))
                 && under
                     .as_deref()
                     .is_none_or(|root| is_within(&folder_key(&session.cwd, cfg!(windows)), root))
@@ -73,6 +80,22 @@ pub fn filter_sessions(
         })
         .map(|(index, _)| index)
         .collect()
+}
+
+/// Moves pinned chats to the front, keeping the order within each group.
+pub fn pinned_first(
+    sessions: &[Session],
+    rows: Vec<usize>,
+    pinned: &BTreeSet<String>,
+) -> Vec<usize> {
+    if pinned.is_empty() {
+        return rows;
+    }
+    let (mut front, rest): (Vec<usize>, Vec<usize>) = rows
+        .into_iter()
+        .partition(|&index| pinned.contains(&sessions[index].id));
+    front.extend(rest);
+    front
 }
 
 /// See [`SessionList::infer_chat`]. `created` reports when a session log was
@@ -133,6 +156,15 @@ impl SessionList {
         })
         .detach();
 
+        // Pins and bookmarks can change from any window.
+        cx.observe_global::<Store>(|this, cx| {
+            if *cx.global::<Store>().chat_marks() != this.marks {
+                this.refilter(cx);
+                cx.notify();
+            }
+        })
+        .detach();
+
         let rescan = cx.spawn(async move |this, cx| loop {
             if this
                 .update(cx, |this: &mut Self, cx| this.rescan(cx))
@@ -150,6 +182,8 @@ impl SessionList {
             agent_filter: None,
             root,
             scope_to_root: false,
+            bookmarks_only: false,
+            marks: cx.global::<Store>().chat_marks().clone(),
             highlighted: 0,
             open_ids: HashSet::new(),
             loaded: false,
@@ -235,13 +269,16 @@ impl SessionList {
     }
 
     fn refilter(&mut self, cx: &App) {
+        self.marks = cx.global::<Store>().chat_marks().clone();
         let root = self.root.to_string_lossy();
-        self.filtered = filter_sessions(
+        let matching = filter_sessions(
             &self.sessions,
             self.search.read(cx).text(),
             self.agent_filter,
             self.scope_to_root.then_some(root.as_ref()),
+            self.bookmarks_only.then_some(&self.marks.bookmarked),
         );
+        self.filtered = pinned_first(&self.sessions, matching, &self.marks.pinned);
         self.highlighted = self.highlighted.min(self.filtered.len().saturating_sub(1));
     }
 
@@ -276,10 +313,50 @@ impl SessionList {
         cx.notify();
     }
 
+    fn toggle_bookmarks_only(&mut self, cx: &mut Context<Self>) {
+        self.bookmarks_only = !self.bookmarks_only;
+        self.highlighted = 0;
+        self.refilter(cx);
+        cx.notify();
+    }
+
+    /// A small button on a chat's row that sets or clears one of its marks.
+    fn render_mark(
+        id: (&'static str, usize),
+        glyph: &'static str,
+        on: bool,
+        chat: &str,
+        set: fn(&mut Store, &str, bool),
+    ) -> impl IntoElement + use<> {
+        let chat = chat.to_string();
+        div()
+            .id(id)
+            .size(px(20.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(4.))
+            .hover(|style| style.bg(theme::bg_active()))
+            .child(icon(
+                glyph,
+                px(12.),
+                if on {
+                    theme::accent()
+                } else {
+                    theme::text_muted()
+                },
+            ))
+            .on_click(move |_, _, cx| {
+                cx.stop_propagation();
+                cx.update_global::<Store, _>(|store, _| set(store, &chat, !on));
+            })
+    }
+
     fn render_chip(
         &self,
         id: &'static str,
-        label: &'static str,
+        label: impl IntoElement,
         active: bool,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
@@ -314,6 +391,8 @@ impl SessionList {
         let session = &self.sessions[self.filtered[row]];
         let highlighted = search_focused && row == self.highlighted;
         let open = self.open_ids.contains(&session.id);
+        let pinned = self.marks.pinned.contains(&session.id);
+        let bookmarked = self.marks.bookmarked.contains(&session.id);
         let agent_color = match session.agent {
             Agent::Claude => theme::claude(),
             Agent::Codex => theme::codex(),
@@ -330,6 +409,8 @@ impl SessionList {
 
         div()
             .id(row)
+            .group("chat-row")
+            .relative()
             .h(px(ROW_HEIGHT))
             .w_full()
             .px(px(10.))
@@ -372,6 +453,46 @@ impl SessionList {
                             .child(detail),
                     ),
             )
+            // The marks a chat has show all the time.
+            .when(pinned, |row| {
+                row.child(icon("pin-filled", px(11.), theme::text_faint()))
+            })
+            .when(bookmarked, |row| {
+                row.child(icon("bookmark-filled", px(11.), theme::accent()))
+            })
+            // Pointing at a row brings up the buttons that change them.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(px(6.))
+                    .pl(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .bg(theme::bg_hover())
+                    .invisible()
+                    .group_hover("chat-row", |style| style.visible())
+                    .child(Self::render_mark(
+                        ("chat-pin", row),
+                        if pinned { "pin-filled" } else { "pin" },
+                        pinned,
+                        &session.id,
+                        Store::set_chat_pinned,
+                    ))
+                    .child(Self::render_mark(
+                        ("chat-bookmark", row),
+                        if bookmarked {
+                            "bookmark-filled"
+                        } else {
+                            "bookmark"
+                        },
+                        bookmarked,
+                        &session.id,
+                        Store::set_chat_bookmarked,
+                    )),
+            )
             .on_click(
                 cx.listener(move |_, _, _, cx| cx.emit(SessionListEvent::Open(opened.clone()))),
             )
@@ -386,6 +507,8 @@ impl Render for SessionList {
                 "Scanning chats…"
             } else if self.sessions.is_empty() {
                 "No Claude Code or Codex chats found"
+            } else if self.bookmarks_only && self.marks.bookmarked.is_empty() {
+                "No bookmarked chats yet"
             } else {
                 "No matching chats"
             };
@@ -461,6 +584,25 @@ impl Render for SessionList {
                         |this, cx| this.set_agent_filter(Some(Agent::Codex), cx),
                     ))
                     .child(div().flex_1())
+                    .child(self.render_chip(
+                        "chip-bookmarks",
+                        icon(
+                            if self.bookmarks_only {
+                                "bookmark-filled"
+                            } else {
+                                "bookmark"
+                            },
+                            px(12.),
+                            if self.bookmarks_only {
+                                theme::accent()
+                            } else {
+                                theme::text_faint()
+                            },
+                        ),
+                        self.bookmarks_only,
+                        cx,
+                        |this, cx| this.toggle_bookmarks_only(cx),
+                    ))
                     .child(self.render_chip(
                         "chip-scope",
                         "This folder",
@@ -542,18 +684,53 @@ mod tests {
             session(Agent::Codex, "Add dark mode", "/work/app/web"),
             session(Agent::Claude, "Write docs", "/work/application"),
         ];
-        assert_eq!(filter_sessions(&sessions, "", None, None), vec![0, 1, 2]);
-        assert_eq!(filter_sessions(&sessions, "LOGIN fix", None, None), vec![0]);
-        assert_eq!(filter_sessions(&sessions, "codex", None, None), vec![1]);
+        assert_eq!(filter_sessions(&sessions, "", None, None, None), vec![0, 1, 2]);
+        assert_eq!(filter_sessions(&sessions, "LOGIN fix", None, None, None), vec![0]);
+        assert_eq!(filter_sessions(&sessions, "codex", None, None, None), vec![1]);
         assert_eq!(
-            filter_sessions(&sessions, "", Some(Agent::Claude), None),
+            filter_sessions(&sessions, "", Some(Agent::Claude), None, None),
             vec![0, 2]
         );
         // `/work/app` must not match the sibling `/work/application`.
         assert_eq!(
-            filter_sessions(&sessions, "", None, Some("/work/app/")),
+            filter_sessions(&sessions, "", None, Some("/work/app/"), None),
             vec![0, 1]
         );
-        assert!(filter_sessions(&sessions, "nothing", None, None).is_empty());
+        assert!(filter_sessions(&sessions, "nothing", None, None, None).is_empty());
+    }
+
+    #[test]
+    fn bookmarks_narrow_the_list_and_pins_lead_it() {
+        let sessions = vec![
+            session(Agent::Claude, "newest", "/work/app"),
+            session(Agent::Codex, "middle", "/work/app"),
+            session(Agent::Claude, "older", "/work/app"),
+            session(Agent::Claude, "oldest", "/work/site"),
+        ];
+        let ids = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| name.to_string()).collect()
+        };
+
+        let bookmarked = ids(&["middle", "oldest", "gone"]);
+        assert_eq!(
+            filter_sessions(&sessions, "", None, None, Some(&bookmarked)),
+            vec![1, 3]
+        );
+        // The other filters still apply to bookmarked chats.
+        assert_eq!(
+            filter_sessions(&sessions, "", Some(Agent::Claude), None, Some(&bookmarked)),
+            vec![3]
+        );
+        assert!(filter_sessions(&sessions, "", None, None, Some(&ids(&[]))).is_empty());
+
+        // Pinned chats come first; each group keeps its newest-first order.
+        let pinned = ids(&["older", "middle"]);
+        assert_eq!(
+            pinned_first(&sessions, vec![0, 1, 2, 3], &pinned),
+            vec![1, 2, 0, 3]
+        );
+        // A pinned chat the search left out stays out.
+        assert_eq!(pinned_first(&sessions, vec![0, 3], &pinned), vec![0, 3]);
+        assert_eq!(pinned_first(&sessions, vec![0, 1], &ids(&[])), vec![0, 1]);
     }
 }

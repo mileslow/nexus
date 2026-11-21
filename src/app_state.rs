@@ -1,7 +1,7 @@
 //! What Nexus remembers between launches: the theme, the workspaces that
 //! have been opened, and how each one was laid out.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -109,10 +109,34 @@ impl WorkspaceRecord {
     }
 }
 
+/// The chats the user has marked, by chat id. They apply in every window.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChatMarks {
+    /// Kept at the top of the chat list.
+    #[serde(default)]
+    pub pinned: BTreeSet<String>,
+    /// Saved to come back to; the list can be narrowed to these.
+    #[serde(default)]
+    pub bookmarked: BTreeSet<String>,
+}
+
+impl ChatMarks {
+    /// Adds `id` to `set` or removes it. Returns true if anything changed.
+    fn set(set: &mut BTreeSet<String>, id: &str, on: bool) -> bool {
+        if on {
+            set.insert(id.to_string())
+        } else {
+            set.remove(id)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AppState {
     #[serde(default)]
     pub theme: Option<String>,
+    #[serde(default)]
+    pub chats: ChatMarks,
     #[serde(default)]
     pub workspaces: Vec<WorkspaceRecord>,
     /// Workspaces whose windows are open, reopened on the next launch.
@@ -258,6 +282,22 @@ impl Store {
         self.state.recent()
     }
 
+    pub fn chat_marks(&self) -> &ChatMarks {
+        &self.state.chats
+    }
+
+    pub fn set_chat_pinned(&mut self, id: &str, pinned: bool) {
+        if ChatMarks::set(&mut self.state.chats.pinned, id, pinned) {
+            self.save();
+        }
+    }
+
+    pub fn set_chat_bookmarked(&mut self, id: &str, bookmarked: bool) {
+        if ChatMarks::set(&mut self.state.chats.bookmarked, id, bookmarked) {
+            self.save();
+        }
+    }
+
     /// Workspaces that were open when the app last ran and still exist.
     pub fn reopen_list(&self) -> Vec<PathBuf> {
         self.state
@@ -353,10 +393,18 @@ mod tests {
             "unchanged"
         );
         state.theme = Some("Nord".into());
+        assert!(ChatMarks::set(&mut state.chats.pinned, "abc", true));
+        assert!(ChatMarks::set(&mut state.chats.bookmarked, "abc", true));
+        assert!(ChatMarks::set(&mut state.chats.bookmarked, "def", true));
+        assert!(!ChatMarks::set(&mut state.chats.bookmarked, "def", true));
+        assert!(ChatMarks::set(&mut state.chats.bookmarked, "def", false));
+        assert!(!ChatMarks::set(&mut state.chats.bookmarked, "def", false));
 
         let bytes = serde_json::to_vec(&state).unwrap();
         let restored = AppState::parse(&bytes);
         assert_eq!(restored, state);
+        assert!(restored.chats.pinned.contains("abc"));
+        assert_eq!(restored.chats.bookmarked.len(), 1);
         assert_eq!(restored.layout_for(Path::new("/work/app")), Some(layout()));
         assert_eq!(layout().counts(), (2, 1));
     }

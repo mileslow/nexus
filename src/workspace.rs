@@ -78,6 +78,22 @@ enum MenuChoice {
     Copy,
     Split(Direction),
     Close,
+    /// Bookmark the tab's chat, or take the bookmark off.
+    Bookmark(bool),
+    /// Pin the tab's chat to the top of the chat list, or unpin it.
+    Pin(bool),
+    BookmarkAndClose,
+}
+
+/// What was right-clicked to open the menu, which decides what it offers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuOrigin {
+    /// A terminal's text: copy, split, close.
+    TerminalText,
+    /// A terminal's row in the sidebar: split, close.
+    SidebarRow,
+    /// A tab in a pane's header: bookmark or pin its chat, close.
+    TabHeader,
 }
 
 /// Where a file that is not open yet gets its tab.
@@ -113,7 +129,7 @@ pub struct Workspace {
     next_split_id: usize,
     window_active: bool,
     /// The right-click menu for a terminal, while it is open.
-    terminal_menu: Option<TerminalMenu>,
+    item_menu: Option<ItemMenu>,
     theme_picker: Entity<ThemePicker>,
     update_badge: Entity<UpdateBadge>,
     app_menu: Entity<AppMenu>,
@@ -121,16 +137,18 @@ pub struct Workspace {
     _tick: Task<()>,
 }
 
-struct TerminalMenu {
+struct ItemMenu {
     position: Point<Pixels>,
     pane: Entity<Pane>,
-    terminal: EntityId,
-    /// Whether the menu was opened over the terminal's text rather than its
-    /// row in the sidebar; only then does it offer Copy.
-    over_text: bool,
+    item: EntityId,
+    origin: MenuOrigin,
     /// What was selected when the menu opened. Held here because output
     /// arriving while the menu is up can clear the selection.
     selection: Option<String>,
+    /// Whether the tab is a terminal running an agent.
+    runs_agent: bool,
+    /// The id of the chat that agent has open, once it can be told.
+    chat: Option<String>,
 }
 
 impl Focusable for Workspace {
@@ -205,7 +223,7 @@ impl Workspace {
             collapsed: [false; 3],
             next_split_id: 0,
             window_active: true,
-            terminal_menu: None,
+            item_menu: None,
             theme_picker: cx.new(|_| ThemePicker::new()),
             update_badge: cx.new(UpdateBadge::new),
             app_menu: cx.new(|_| AppMenu::new()),
@@ -783,7 +801,16 @@ impl Workspace {
             PaneEvent::Open(target) => self.open_link(target, pane, window, cx),
             PaneEvent::Split(direction) => self.split_pane(pane, *direction, window, cx),
             PaneEvent::ContextMenu { position, item } => {
-                self.open_terminal_menu(*position, pane.clone(), *item, true, cx)
+                self.open_item_menu(
+                    *position,
+                    pane.clone(),
+                    *item,
+                    MenuOrigin::TerminalText,
+                    cx,
+                )
+            }
+            PaneEvent::TabMenu { position, item } => {
+                self.open_item_menu(*position, pane.clone(), *item, MenuOrigin::TabHeader, cx)
             }
             PaneEvent::TabDropped {
                 item,
@@ -896,112 +923,233 @@ impl Workspace {
         cx.notify();
     }
 
-    // ---- terminal right-click menu ------------------------------------------
+    // ---- right-click menus ----------------------------------------------------
 
-    fn open_terminal_menu(
+    fn open_item_menu(
         &mut self,
         position: Point<Pixels>,
         pane: Entity<Pane>,
-        terminal: EntityId,
-        over_text: bool,
+        item: EntityId,
+        origin: MenuOrigin,
         cx: &mut Context<Self>,
     ) {
-        let selection = if over_text {
+        let terminal = {
             let pane = pane.read(cx);
-            pane.index_of(terminal)
-                .and_then(|index| pane.items()[index].as_terminal())
-                .and_then(|terminal| terminal.read(cx).selected_text())
-        } else {
-            None
+            pane.index_of(item)
+                .and_then(|index| pane.items()[index].as_terminal().cloned())
         };
-        self.terminal_menu = Some(TerminalMenu {
+        let selection = match (&terminal, origin) {
+            (Some(terminal), MenuOrigin::TerminalText) => terminal.read(cx).selected_text(),
+            _ => None,
+        };
+        let runs_agent = terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.read(cx).agent.is_some());
+        let chat = (runs_agent && origin == MenuOrigin::TabHeader)
+            .then(|| self.running_chats(cx).remove(&item))
+            .flatten()
+            .map(|chat| chat.id);
+        self.item_menu = Some(ItemMenu {
             position,
             pane,
-            terminal,
-            over_text,
+            item,
+            origin,
             selection,
+            runs_agent,
+            chat,
         });
         cx.notify();
     }
 
-    fn dismiss_terminal_menu(&mut self, cx: &mut Context<Self>) {
-        if self.terminal_menu.take().is_some() {
+    fn dismiss_item_menu(&mut self, cx: &mut Context<Self>) {
+        if self.item_menu.take().is_some() {
             cx.notify();
         }
     }
 
-    /// Runs a menu choice against the terminal the menu was opened on.
-    fn choose_from_terminal_menu(
+    /// Runs a menu choice against the tab the menu was opened on.
+    fn choose_from_item_menu(
         &mut self,
         choice: MenuChoice,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(menu) = self.terminal_menu.take() else {
+        let Some(menu) = self.item_menu.take() else {
             return;
         };
         cx.notify();
-        if let MenuChoice::Copy = choice {
-            if let Some(text) = menu.selection {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+        // These still make sense if the pane closed while the menu was open.
+        match (choice, &menu.chat) {
+            (MenuChoice::Copy, _) => {
+                if let Some(text) = menu.selection {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                return;
             }
-            return;
+            (MenuChoice::Bookmark(on), Some(chat)) => {
+                cx.update_global::<Store, _>(|store, _| store.set_chat_bookmarked(chat, on));
+                return;
+            }
+            (MenuChoice::Pin(on), Some(chat)) => {
+                cx.update_global::<Store, _>(|store, _| store.set_chat_pinned(chat, on));
+                return;
+            }
+            (MenuChoice::BookmarkAndClose, Some(chat)) => {
+                cx.update_global::<Store, _>(|store, _| store.set_chat_bookmarked(chat, true));
+            }
+            _ => {}
         }
-        // The pane may have been closed while the menu was open.
         if !self.center.contains(&menu.pane) {
             return;
         }
-        match choice {
-            MenuChoice::Copy => {}
-            MenuChoice::Split(direction) => self.split_pane(&menu.pane, direction, window, cx),
-            MenuChoice::Close => menu.pane.update(cx, |pane, cx| {
-                if let Some(index) = pane.index_of(menu.terminal) {
+        let close = match choice {
+            MenuChoice::Split(direction) => {
+                self.split_pane(&menu.pane, direction, window, cx);
+                false
+            }
+            MenuChoice::Close => true,
+            // Without a chat to bookmark, leave the tab open.
+            MenuChoice::BookmarkAndClose => menu.chat.is_some(),
+            _ => false,
+        };
+        if close {
+            menu.pane.update(cx, |pane, cx| {
+                if let Some(index) = pane.index_of(menu.item) {
                     pane.close_item(index, window, cx);
                 }
-            }),
+            });
         }
     }
 
-    fn render_terminal_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let menu = self.terminal_menu.as_ref()?;
-        let row =
-            |id: &'static str, glyph: &'static str, label: &'static str, choice: MenuChoice| {
-                div()
-                    .id(id)
-                    .h(px(26.))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .rounded(px(5.))
+    fn render_item_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let menu = self.item_menu.as_ref()?;
+        // A row with no choice is shown dimmed and does nothing, so the rows
+        // around it keep their places.
+        let row = |id: &'static str,
+                   glyph: &'static str,
+                   label: &'static str,
+                   choice: Option<MenuChoice>| {
+            let row = div()
+                .id(id)
+                .h(px(26.))
+                .px(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .rounded(px(5.));
+            match choice {
+                Some(choice) => row
                     .cursor_pointer()
                     .hover(|style| style.bg(theme::bg_active()))
                     .child(icon(glyph, px(13.), theme::text_muted()))
                     .child(label)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.choose_from_terminal_menu(choice, window, cx)
-                    }))
-            };
-        // Copy stays in the menu with nothing selected, dimmed, so the other
-        // rows keep their places.
-        let copy = menu.over_text.then(|| {
-            let separator = div().h(px(1.)).my(px(4.)).mx(px(4.)).bg(theme::border());
-            let item = if menu.selection.is_some() {
-                row("menu-copy", "copy", "Copy", MenuChoice::Copy).into_any_element()
-            } else {
-                div()
-                    .h(px(26.))
-                    .px(px(8.))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
+                        this.choose_from_item_menu(choice, window, cx)
+                    })),
+                None => row
                     .text_color(theme::text_faint())
-                    .child(icon("copy", px(13.), theme::text_faint()))
-                    .child("Copy")
-                    .into_any_element()
-            };
-            [item, separator.into_any_element()]
-        });
+                    .child(icon(glyph, px(13.), theme::text_faint()))
+                    .child(label),
+            }
+            .into_any_element()
+        };
+        let separator = || {
+            div()
+                .h(px(1.))
+                .my(px(4.))
+                .mx(px(4.))
+                .bg(theme::border())
+                .into_any_element()
+        };
+        let splits = || {
+            [
+                ("menu-split-up", "arrow-up", "Split Up", Direction::Up),
+                (
+                    "menu-split-right",
+                    "arrow-right",
+                    "Split Right",
+                    Direction::Right,
+                ),
+                (
+                    "menu-split-down",
+                    "arrow-down",
+                    "Split Down",
+                    Direction::Down,
+                ),
+                (
+                    "menu-split-left",
+                    "arrow-left",
+                    "Split Left",
+                    Direction::Left,
+                ),
+            ]
+            .map(|(id, glyph, label, direction)| {
+                row(id, glyph, label, Some(MenuChoice::Split(direction)))
+            })
+        };
+        let close = || row("menu-close", "close", "Close", Some(MenuChoice::Close));
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        match menu.origin {
+            MenuOrigin::TerminalText => {
+                let copy = menu.selection.is_some().then_some(MenuChoice::Copy);
+                rows.push(row("menu-copy", "copy", "Copy", copy));
+                rows.push(separator());
+                rows.extend(splits());
+                rows.push(separator());
+                rows.push(close());
+            }
+            MenuOrigin::SidebarRow => {
+                rows.extend(splits());
+                rows.push(separator());
+                rows.push(close());
+            }
+            MenuOrigin::TabHeader => {
+                // An agent's chat can be marked; until the agent has said
+                // which chat it is, the rows are there but dimmed.
+                let marks = cx.global::<Store>().chat_marks();
+                let chat = menu.chat.as_deref();
+                let bookmarked = chat.is_some_and(|chat| marks.bookmarked.contains(chat));
+                let pinned = chat.is_some_and(|chat| marks.pinned.contains(chat));
+                if menu.runs_agent {
+                    rows.push(if bookmarked {
+                        row(
+                            "menu-bookmark",
+                            "bookmark-filled",
+                            "Remove Bookmark",
+                            Some(MenuChoice::Bookmark(false)),
+                        )
+                    } else {
+                        row(
+                            "menu-bookmark",
+                            "bookmark",
+                            "Bookmark",
+                            chat.map(|_| MenuChoice::Bookmark(true)),
+                        )
+                    });
+                    rows.push(if pinned {
+                        row(
+                            "menu-pin",
+                            "pin-filled",
+                            "Unpin",
+                            Some(MenuChoice::Pin(false)),
+                        )
+                    } else {
+                        row("menu-pin", "pin", "Pin", chat.map(|_| MenuChoice::Pin(true)))
+                    });
+                    rows.push(separator());
+                }
+                rows.push(close());
+                if menu.runs_agent && !bookmarked {
+                    rows.push(row(
+                        "menu-bookmark-close",
+                        "bookmark",
+                        "Bookmark and Close",
+                        chat.map(|_| MenuChoice::BookmarkAndClose),
+                    ));
+                }
+            }
+        }
         Some(
             deferred(
                 anchored()
@@ -1009,9 +1157,9 @@ impl Workspace {
                     .snap_to_window_with_margin(px(8.))
                     .child(
                         div()
-                            .id("terminal-menu")
+                            .id("item-menu")
                             .occlude()
-                            .w(px(168.))
+                            .w(px(180.))
                             .p(px(4.))
                             .flex()
                             .flex_col()
@@ -1022,35 +1170,9 @@ impl Workspace {
                             .shadow_lg()
                             .text_color(theme::text())
                             .on_mouse_down_out(
-                                cx.listener(|this, _, _, cx| this.dismiss_terminal_menu(cx)),
+                                cx.listener(|this, _, _, cx| this.dismiss_item_menu(cx)),
                             )
-                            .children(copy.into_iter().flatten())
-                            .child(row(
-                                "menu-split-up",
-                                "arrow-up",
-                                "Split Up",
-                                MenuChoice::Split(Direction::Up),
-                            ))
-                            .child(row(
-                                "menu-split-right",
-                                "arrow-right",
-                                "Split Right",
-                                MenuChoice::Split(Direction::Right),
-                            ))
-                            .child(row(
-                                "menu-split-down",
-                                "arrow-down",
-                                "Split Down",
-                                MenuChoice::Split(Direction::Down),
-                            ))
-                            .child(row(
-                                "menu-split-left",
-                                "arrow-left",
-                                "Split Left",
-                                MenuChoice::Split(Direction::Left),
-                            ))
-                            .child(div().h(px(1.)).my(px(4.)).mx(px(4.)).bg(theme::border()))
-                            .child(row("menu-close", "close", "Close", MenuChoice::Close)),
+                            .children(rows),
                     ),
             )
             .with_priority(1),
@@ -1251,11 +1373,11 @@ impl Workspace {
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                this.open_terminal_menu(
+                                this.open_item_menu(
                                     event.position,
                                     menu_pane.clone(),
                                     terminal_id,
-                                    false,
+                                    MenuOrigin::SidebarRow,
                                     cx,
                                 )
                             }),
@@ -1694,8 +1816,8 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             // Any key dismisses the terminal menu; Escape does only that.
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if this.terminal_menu.is_some() {
-                    this.dismiss_terminal_menu(cx);
+                if this.item_menu.is_some() {
+                    this.dismiss_item_menu(cx);
                     if event.keystroke.key == "escape" {
                         cx.stop_propagation();
                     }
@@ -1765,7 +1887,7 @@ impl Render for Workspace {
                     })
                     .child(div().flex_1().min_w_0().h_full().child(center)),
             )
-            .children(self.render_terminal_menu(cx))
+            .children(self.render_item_menu(cx))
     }
 }
 
