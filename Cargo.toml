@@ -1,6 +1,6 @@
 [package]
 name = "nexus"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 description = "A fast agent multiplexer / IDE built with Rust and GPUI"
 
