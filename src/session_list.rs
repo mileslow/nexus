@@ -3,15 +3,16 @@
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, uniform_list, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window,
+    div, prelude::*, px, uniform_list, AnyElement, App, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, ScrollStrategy, SharedString, Task, UniformListScrollHandle, Window,
 };
 
 use crate::app_state::{ChatMarks, SavedChat, Store};
 use crate::assets::icon;
+use crate::chat_search::{self, Match};
 use crate::platform::{folder_key, is_within};
 use crate::sessions::{self, Agent, Session};
 use crate::text_input::{TextInput, TextInputEvent};
@@ -19,6 +20,39 @@ use crate::theme;
 
 const RESCAN_INTERVAL: Duration = Duration::from_secs(20);
 const ROW_HEIGHT: f32 = 44.;
+/// Rows the agent found are taller: they say why.
+const FOUND_ROW_HEIGHT: f32 = 76.;
+const SEARCH_PLACEHOLDER: &str = "Search chats";
+const ASK_PLACEHOLDER: &str = "Describe a chat, then press Return";
+
+/// Stops a search by description when it is no longer wanted.
+struct StopOnDrop(Arc<chat_search::Handle>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Where a search by description stands.
+enum AgentSearch {
+    Idle,
+    Running {
+        /// How many chats the agent is reading, and how many older ones
+        /// were left out.
+        reading: usize,
+        left_out: usize,
+        started: Instant,
+        search: StopOnDrop,
+        /// Keeps the elapsed time on screen moving.
+        _tick: Task<()>,
+    },
+    Found {
+        query: String,
+        matches: Vec<Match>,
+    },
+    Failed(String),
+}
 
 pub enum SessionListEvent {
     Open(Session),
@@ -39,6 +73,12 @@ pub struct SessionList {
     bookmarks_only: bool,
     /// The pins and bookmarks the list was last arranged by.
     marks: ChatMarks,
+    /// When set, the search box takes a description for an agent to find
+    /// chats by, instead of words to filter titles with.
+    ask: bool,
+    agent_search: AgentSearch,
+    /// What "This folder" was set to before asking turned it on.
+    scope_before_ask: bool,
     highlighted: usize,
     open_ids: HashSet<String>,
     loaded: bool,
@@ -98,6 +138,20 @@ pub fn pinned_first(
     front
 }
 
+/// The rows for what an agent found, in its order, keeping only chats that
+/// are still listed.
+pub fn found_rows(sessions: &[Session], listed: &[usize], matches: &[Match]) -> Vec<usize> {
+    matches
+        .iter()
+        .filter_map(|found| {
+            listed
+                .iter()
+                .copied()
+                .find(|&index| sessions[index].id == found.id)
+        })
+        .collect()
+}
+
 /// See [`SessionList::infer_chat`]. `created` reports when a session log was
 /// created, in seconds since the Unix epoch.
 pub fn infer_chat(
@@ -131,8 +185,11 @@ pub fn infer_chat(
 
 impl SessionList {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| TextInput::new("Search chats", cx));
+        let search = cx.new(|cx| TextInput::new(SEARCH_PLACEHOLDER, cx));
         cx.subscribe(&search, |this, _, event: &TextInputEvent, cx| match event {
+            // A description is for the agent: it filters nothing as it is
+            // typed, and what was found stays until the next search.
+            TextInputEvent::Changed if this.ask => cx.notify(),
             TextInputEvent::Changed => {
                 this.highlighted = 0;
                 this.refilter(cx);
@@ -140,12 +197,20 @@ impl SessionList {
                 cx.notify();
             }
             TextInputEvent::Submit => {
-                if let Some(session) = this.session_at(this.highlighted) {
+                if this.ask && !this.shows_answer_to(this.search.read(cx).text()) {
+                    this.start_agent_search(cx);
+                } else if let Some(session) = this.session_at(this.highlighted) {
                     cx.emit(SessionListEvent::Open(session.clone()));
                 }
             }
             TextInputEvent::Cancel => {
-                if this.search.read(cx).text().is_empty() {
+                let empty = this.search.read(cx).text().is_empty();
+                if matches!(this.agent_search, AgentSearch::Running { .. }) {
+                    this.set_agent_search(AgentSearch::Idle, cx);
+                } else if !matches!(this.agent_search, AgentSearch::Idle) {
+                    this.set_agent_search(AgentSearch::Idle, cx);
+                    this.search.update(cx, |search, cx| search.clear(cx));
+                } else if empty {
                     cx.emit(SessionListEvent::Dismissed);
                 } else {
                     this.search.update(cx, |search, cx| search.clear(cx));
@@ -184,6 +249,9 @@ impl SessionList {
             scope_to_root: false,
             bookmarks_only: false,
             marks: cx.global::<Store>().chat_marks().clone(),
+            ask: false,
+            agent_search: AgentSearch::Idle,
+            scope_before_ask: false,
             highlighted: 0,
             open_ids: HashSet::new(),
             loaded: false,
@@ -270,16 +338,132 @@ impl SessionList {
 
     fn refilter(&mut self, cx: &App) {
         self.marks = cx.global::<Store>().chat_marks().clone();
+        let words = if self.ask {
+            ""
+        } else {
+            self.search.read(cx).text()
+        };
+        let matching = self.listed(words);
+        self.filtered = match &self.agent_search {
+            AgentSearch::Found { matches, .. } => found_rows(&self.sessions, &matching, matches),
+            _ => pinned_first(&self.sessions, matching, &self.marks.pinned),
+        };
+        self.highlighted = self.highlighted.min(self.filtered.len().saturating_sub(1));
+    }
+
+    /// The chats the chips allow whose titles hold every word of `words`,
+    /// newest first.
+    fn listed(&self, words: &str) -> Vec<usize> {
         let root = self.root.to_string_lossy();
-        let matching = filter_sessions(
+        filter_sessions(
             &self.sessions,
-            self.search.read(cx).text(),
+            words,
             self.agent_filter,
             self.scope_to_root.then_some(root.as_ref()),
             self.bookmarks_only.then_some(&self.marks.bookmarked),
-        );
-        self.filtered = pinned_first(&self.sessions, matching, &self.marks.pinned);
-        self.highlighted = self.highlighted.min(self.filtered.len().saturating_sub(1));
+        )
+    }
+
+    /// Whether the list is showing what the agent found for `description`.
+    fn shows_answer_to(&self, description: &str) -> bool {
+        matches!(&self.agent_search, AgentSearch::Found { query, .. } if query == description.trim())
+    }
+
+    fn set_agent_search(&mut self, search: AgentSearch, cx: &mut Context<Self>) {
+        self.agent_search = search;
+        self.highlighted = 0;
+        self.refilter(cx);
+        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Switches the search box between filtering by words and describing a
+    /// chat for an agent to find.
+    fn toggle_ask(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask = !self.ask;
+        if self.ask {
+            // The chats of this folder are the ones worth an agent's time;
+            // "This folder" can still be turned off to search them all.
+            self.scope_before_ask = self.scope_to_root;
+            self.scope_to_root = true;
+        } else {
+            self.scope_to_root = self.scope_before_ask;
+        }
+        let placeholder = if self.ask {
+            ASK_PLACEHOLDER
+        } else {
+            SEARCH_PLACEHOLDER
+        };
+        self.search
+            .update(cx, |search, cx| search.set_placeholder(placeholder, cx));
+        window.focus(&self.search.focus_handle(cx));
+        self.set_agent_search(AgentSearch::Idle, cx);
+    }
+
+    /// Hands the description in the search box, and the chats now listed,
+    /// to an agent.
+    fn start_agent_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.search.read(cx).text().trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        let listed = self.listed("");
+        let left_out = listed.len().saturating_sub(chat_search::MAX_CHATS);
+        let chats: Vec<Session> = listed
+            .iter()
+            .take(chat_search::MAX_CHATS)
+            .map(|&index| self.sessions[index].clone())
+            .collect();
+        if chats.is_empty() {
+            let nothing = AgentSearch::Found {
+                query,
+                matches: Vec::new(),
+            };
+            return self.set_agent_search(nothing, cx);
+        }
+
+        let handle = Arc::new(chat_search::Handle::default());
+        let reading = chats.len();
+        cx.spawn({
+            let handle = handle.clone();
+            async move |this, cx| {
+                let outcome = cx
+                    .background_spawn({
+                        let (handle, query) = (handle.clone(), query.clone());
+                        async move { chat_search::run(&query, &chats, &handle) }
+                    })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    // A search that was stopped or replaced has nothing to say.
+                    let current = matches!(
+                        &this.agent_search,
+                        AgentSearch::Running { search, .. } if Arc::ptr_eq(&search.0, &handle)
+                    );
+                    if current {
+                        let search = match outcome {
+                            Ok(matches) => AgentSearch::Found { query, matches },
+                            Err(message) => AgentSearch::Failed(message),
+                        };
+                        this.set_agent_search(search, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+        let tick = cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                break;
+            }
+        });
+        let running = AgentSearch::Running {
+            reading,
+            left_out,
+            started: Instant::now(),
+            search: StopOnDrop(handle),
+            _tick: tick,
+        };
+        self.set_agent_search(running, cx);
     }
 
     fn session_at(&self, row: usize) -> Option<&Session> {
@@ -318,6 +502,137 @@ impl SessionList {
         self.highlighted = 0;
         self.refilter(cx);
         cx.notify();
+    }
+
+    /// Why the agent picked this chat, when the list shows what it found.
+    fn reason_for(&self, id: &str) -> Option<&str> {
+        match &self.agent_search {
+            AgentSearch::Found { matches, .. } => matches
+                .iter()
+                .find(|found| found.id == id)
+                .map(|found| found.reason.as_str()),
+            _ => None,
+        }
+    }
+
+    fn row_height(&self) -> f32 {
+        match self.agent_search {
+            AgentSearch::Found { .. } => FOUND_ROW_HEIGHT,
+            _ => ROW_HEIGHT,
+        }
+    }
+
+    /// The button in the search box that turns asking an agent on and off.
+    fn render_ask_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let on = self.ask;
+        div()
+            .id("ask-toggle")
+            .flex_none()
+            .h(px(20.))
+            .px(px(5.))
+            .flex()
+            .items_center()
+            .gap(px(3.))
+            .rounded(px(4.))
+            .text_size(px(11.))
+            .cursor_pointer()
+            .when(on, |toggle| {
+                toggle.bg(theme::bg_active()).text_color(theme::text())
+            })
+            .when(!on, |toggle| {
+                toggle
+                    .text_color(theme::text_faint())
+                    .hover(|style| style.bg(theme::bg_hover()).text_color(theme::text_muted()))
+            })
+            .child(icon(
+                "sparkle",
+                px(11.),
+                if on {
+                    theme::accent()
+                } else {
+                    theme::text_faint()
+                },
+            ))
+            .child("Ask")
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_ask(window, cx)))
+    }
+
+    /// The line under the chips that says what the agent is up to.
+    fn render_ask_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.ask {
+            return None;
+        }
+        let (text, color, stoppable) = match &self.agent_search {
+            AgentSearch::Idle => (
+                format!(
+                    "Say what the chat was about. {} reads the chats listed here and picks out the ones that match.",
+                    chat_search::AGENT_NAME
+                ),
+                theme::text_faint(),
+                false,
+            ),
+            AgentSearch::Running {
+                reading,
+                left_out,
+                started,
+                ..
+            } => {
+                let chats = match (*reading, *left_out) {
+                    (1, 0) => "1 chat".to_string(),
+                    (count, 0) => format!("{count} chats"),
+                    (count, _) => format!("the {count} most recent chats"),
+                };
+                (
+                    format!(
+                        "{} is reading {chats}… {}s",
+                        chat_search::AGENT_NAME,
+                        started.elapsed().as_secs()
+                    ),
+                    theme::text_muted(),
+                    true,
+                )
+            }
+            AgentSearch::Found { .. } => match self.filtered.len() {
+                // The empty list says so itself.
+                0 => return None,
+                1 => ("1 chat found".to_string(), theme::text_faint(), false),
+                count => (
+                    format!("{count} chats found, best match first"),
+                    theme::text_faint(),
+                    false,
+                ),
+            },
+            AgentSearch::Failed(message) => (message.clone(), theme::red(), false),
+        };
+        Some(
+            div()
+                .flex_none()
+                .px(px(10.))
+                .pb(px(6.))
+                .flex()
+                .items_start()
+                .gap(px(6.))
+                .text_size(px(11.))
+                .child(div().flex_1().min_w_0().text_color(color).child(text))
+                .when(stoppable, |line| {
+                    line.child(
+                        div()
+                            .id("ask-stop")
+                            .flex_none()
+                            .px(px(6.))
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .text_color(theme::text_muted())
+                            .bg(theme::bg_hover())
+                            .hover(|style| style.bg(theme::bg_active()).text_color(theme::text()))
+                            .child("Stop")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_agent_search(AgentSearch::Idle, cx)
+                            })),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     /// A small button on a chat's row that sets or clears one of its marks.
@@ -398,20 +713,26 @@ impl SessionList {
             Agent::Codex => theme::codex(),
         };
         let title: SharedString = session.title.clone().into();
-        let detail: SharedString = format!(
-            "{} · {} · {}",
-            session.agent.label(),
-            session.project_name(),
-            sessions::format_age(session.modified, now)
-        )
+        let age = sessions::format_age(session.modified, now);
+        // A chat the agent found says why, on up to three lines.
+        let reason = self.reason_for(&session.id);
+        let detail: SharedString = match reason {
+            Some(reason) => format!("{age} · {reason}"),
+            None => format!(
+                "{} · {} · {age}",
+                session.agent.label(),
+                session.project_name()
+            ),
+        }
         .into();
+        let found = reason.is_some();
         let opened = session.clone();
 
         div()
             .id(row)
             .group("chat-row")
             .relative()
-            .h(px(ROW_HEIGHT))
+            .h(px(self.row_height()))
             .w_full()
             .px(px(10.))
             .flex()
@@ -447,9 +768,15 @@ impl SessionList {
                     )
                     .child(
                         div()
-                            .truncate()
                             .text_size(px(11.))
                             .text_color(theme::text_faint())
+                            .map(|line| {
+                                if found {
+                                    line.line_clamp(3).text_ellipsis()
+                                } else {
+                                    line.truncate()
+                                }
+                            })
                             .child(detail),
                     ),
             )
@@ -509,6 +836,8 @@ impl Render for SessionList {
                 "No Claude Code or Codex chats found"
             } else if self.bookmarks_only && self.marks.bookmarked.is_empty() {
                 "No bookmarked chats yet"
+            } else if matches!(self.agent_search, AgentSearch::Found { .. }) {
+                "No chats match that description"
             } else {
                 "No matching chats"
             };
@@ -543,7 +872,8 @@ impl Render for SessionList {
                     .mx(px(8.))
                     .mt(px(2.))
                     .h(px(28.))
-                    .px(px(8.))
+                    .pl(px(8.))
+                    .pr(px(3.))
                     .flex()
                     .items_center()
                     .gap(px(6.))
@@ -552,7 +882,8 @@ impl Render for SessionList {
                     .border_1()
                     .border_color(theme::border())
                     .child(icon("search", px(13.), theme::text_faint()))
-                    .child(self.search.clone()),
+                    .child(self.search.clone())
+                    .child(self.render_ask_toggle(cx)),
             )
             .child(
                 div()
@@ -611,6 +942,7 @@ impl Render for SessionList {
                         |this, cx| this.toggle_scope(cx),
                     )),
             )
+            .children(self.render_ask_status(cx))
             .child(div().flex_1().min_h_0().child(list))
     }
 }
@@ -732,5 +1064,32 @@ mod tests {
         // A pinned chat the search left out stays out.
         assert_eq!(pinned_first(&sessions, vec![0, 3], &pinned), vec![0, 3]);
         assert_eq!(pinned_first(&sessions, vec![0, 1], &ids(&[])), vec![0, 1]);
+    }
+
+    #[test]
+    fn found_chats_keep_the_agents_order() {
+        let sessions = vec![
+            session(Agent::Claude, "newest", "/work/app"),
+            session(Agent::Codex, "middle", "/work/app"),
+            session(Agent::Claude, "oldest", "/work/site"),
+        ];
+        let found = |ids: &[&str]| -> Vec<Match> {
+            ids.iter()
+                .map(|id| Match {
+                    id: id.to_string(),
+                    reason: String::new(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            found_rows(&sessions, &[0, 1, 2], &found(&["oldest", "newest"])),
+            vec![2, 0]
+        );
+        // Chats the chips have since hidden, or that are gone, drop out.
+        assert_eq!(
+            found_rows(&sessions, &[0, 1], &found(&["oldest", "gone", "middle"])),
+            vec![1]
+        );
+        assert!(found_rows(&sessions, &[0, 1, 2], &[]).is_empty());
     }
 }

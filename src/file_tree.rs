@@ -1,20 +1,31 @@
-//! The file explorer: a lazily loaded, virtualized directory tree.
+//! The file explorer: a lazily loaded, virtualized directory tree, and a
+//! search box that finds files by name and lines by their text.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
-    div, prelude::*, px, uniform_list, Context, EventEmitter, ScrollStrategy, SharedString, Task,
-    UniformListScrollHandle, Window,
+    div, prelude::*, px, uniform_list, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    HighlightStyle, ScrollStrategy, SharedString, StyledText, Task, UniformListScrollHandle,
+    Window,
 };
 
 use crate::assets::icon;
+use crate::file_search::{self, Indexed, LineHit};
+use crate::find;
+use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// A list of the folder's files older than this is read again.
+const INDEX_LIFETIME: Duration = Duration::from_secs(10);
+/// How long typing must pause before the files' text is searched.
+const TEXT_SEARCH_DELAY: Duration = Duration::from_millis(140);
+const MAX_NAME_HITS: usize = 50;
 
 /// Directories that are usually generated; shown dimmed.
 const NOISY_DIRS: &[&str] = &[
@@ -27,7 +38,59 @@ const NOISY_DIRS: &[&str] = &[
 ];
 
 pub enum FileTreeEvent {
-    OpenFile(PathBuf),
+    /// Open a file, at a line (counted from 1) when one was picked.
+    OpenFile(PathBuf, Option<u32>),
+    /// Escape pressed in an empty search box: hand focus back to the panes.
+    Dismissed,
+}
+
+/// A row of search results.
+enum Hit {
+    /// The heading over a group of results.
+    Heading(SharedString),
+    /// A file found by name, or one whose lines follow.
+    File { file: usize, opens: bool },
+    Line(LineHit),
+}
+
+impl Hit {
+    /// Whether the row can be picked.
+    fn opens(&self) -> bool {
+        match self {
+            Hit::Heading(_) => false,
+            Hit::File { opens, .. } => *opens,
+            Hit::Line(_) => true,
+        }
+    }
+}
+
+/// Lays out the rows for what a search found. `lines` come grouped by file.
+fn result_rows(names: &[usize], lines: Vec<LineHit>) -> Vec<Hit> {
+    let mut rows = Vec::new();
+    if !names.is_empty() {
+        rows.push(Hit::Heading("FILES".into()));
+        rows.extend(names.iter().map(|&file| Hit::File { file, opens: true }));
+    }
+    if !lines.is_empty() {
+        let capped = if lines.len() >= file_search::MAX_LINES {
+            "+"
+        } else {
+            ""
+        };
+        rows.push(Hit::Heading(format!("TEXT  {}{capped}", lines.len()).into()));
+        let mut last = None;
+        for line in lines {
+            if last != Some(line.file) {
+                last = Some(line.file);
+                rows.push(Hit::File {
+                    file: line.file,
+                    opens: false,
+                });
+            }
+            rows.push(Hit::Line(line));
+        }
+    }
+    rows
 }
 
 /// A file or folder being dragged out of the tree.
@@ -94,10 +157,30 @@ pub struct FileTree {
     rows: Vec<Row>,
     selected: Option<PathBuf>,
     scroll: UniformListScrollHandle,
+    search: Entity<TextInput>,
+    /// Every file in the folder, as of `indexed_at`.
+    index: Arc<Vec<Indexed>>,
+    indexed_at: Option<Instant>,
+    indexing: bool,
+    /// What the search box's text found; empty while it is empty.
+    hits: Vec<Hit>,
+    /// The files found by name, kept while their text is still being read.
+    name_hits: Vec<usize>,
+    highlighted: usize,
+    searching_text: bool,
+    stop_text_search: Arc<AtomicBool>,
+    hit_scroll: UniformListScrollHandle,
+    _text_search: Option<Task<()>>,
     _poll: Task<()>,
 }
 
 impl EventEmitter<FileTreeEvent> for FileTree {}
+
+impl Focusable for FileTree {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.search.focus_handle(cx)
+    }
+}
 
 /// Lists a directory: folders first, then case-insensitive by name.
 fn read_children(dir: &Path) -> Vec<Child> {
@@ -170,7 +253,34 @@ impl FileTree {
             }
         });
 
+        let search = cx.new(|cx| TextInput::new("Search files", cx));
+        cx.subscribe(&search, |this, _, event: &TextInputEvent, cx| match event {
+            TextInputEvent::Changed => this.search_changed(cx),
+            TextInputEvent::Submit => this.open_hit(this.highlighted, cx),
+            TextInputEvent::Cancel => {
+                if this.search.read(cx).text().is_empty() {
+                    cx.emit(FileTreeEvent::Dismissed);
+                } else {
+                    this.search.update(cx, |search, cx| search.clear(cx));
+                }
+            }
+            TextInputEvent::MoveDown => this.move_highlight(true, cx),
+            TextInputEvent::MoveUp => this.move_highlight(false, cx),
+        })
+        .detach();
+
         let mut this = Self {
+            search,
+            index: Arc::new(Vec::new()),
+            indexed_at: None,
+            indexing: false,
+            hits: Vec::new(),
+            name_hits: Vec::new(),
+            highlighted: 0,
+            searching_text: false,
+            stop_text_search: Arc::new(AtomicBool::new(false)),
+            hit_scroll: UniformListScrollHandle::new(),
+            _text_search: None,
             root: root.clone(),
             children: HashMap::new(),
             mtimes: HashMap::new(),
@@ -283,9 +393,246 @@ impl FileTree {
         if row.is_dir {
             self.toggle_dir(path, cx);
         } else {
-            cx.emit(FileTreeEvent::OpenFile(path));
+            cx.emit(FileTreeEvent::OpenFile(path, None));
             cx.notify();
         }
+    }
+
+    // ---- search ---------------------------------------------------------------
+
+    fn query(&self, cx: &App) -> String {
+        self.search.read(cx).text().trim().to_string()
+    }
+
+    /// Lists the folder's files again, off the UI thread, then searches again.
+    fn reindex(&mut self, cx: &mut Context<Self>) {
+        if self.indexing {
+            return;
+        }
+        self.indexing = true;
+        let root = self.root.clone();
+        cx.spawn(async move |this, cx| {
+            let files = cx
+                .background_spawn(async move { file_search::list_files(&root) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.indexing = false;
+                this.indexed_at = Some(Instant::now());
+                if *this.index != files {
+                    this.index = Arc::new(files);
+                }
+                this.run_search(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn search_changed(&mut self, cx: &mut Context<Self>) {
+        self.highlighted = 0;
+        self.hit_scroll.scroll_to_item(0, ScrollStrategy::Top);
+        // Agents add and remove files all the time.
+        let stale = self
+            .indexed_at
+            .is_none_or(|at| at.elapsed() > INDEX_LIFETIME);
+        if stale && !self.query(cx).is_empty() {
+            self.reindex(cx);
+        }
+        self.run_search(cx);
+    }
+
+    /// Finds names at once, and text shortly after typing stops.
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        self.stop_text_search.store(true, Ordering::Relaxed);
+        self._text_search = None;
+        self.searching_text = false;
+
+        let query = self.query(cx);
+        self.name_hits = file_search::name_matches(&self.index, &query, MAX_NAME_HITS);
+        self.hits = result_rows(&self.name_hits, Vec::new());
+        self.settle_highlight();
+        cx.notify();
+        if query.chars().count() < file_search::MIN_TEXT_QUERY || self.index.is_empty() {
+            return;
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        self.stop_text_search = stop.clone();
+        self.searching_text = true;
+        let files = self.index.clone();
+        self._text_search = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TEXT_SEARCH_DELAY).await;
+            let lines = cx
+                .background_spawn(async move {
+                    file_search::text_matches(&files, &query, &stop)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.searching_text = false;
+                this.hits = result_rows(&this.name_hits, lines);
+                this.settle_highlight();
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Keeps the highlight on a row that can be picked.
+    fn settle_highlight(&mut self) {
+        let last = self.hits.len().saturating_sub(1);
+        self.highlighted = self.highlighted.min(last);
+        if !self.hits.get(self.highlighted).is_some_and(Hit::opens) {
+            self.highlighted = (self.highlighted..self.hits.len())
+                .find(|&row| self.hits[row].opens())
+                .unwrap_or(self.highlighted);
+        }
+    }
+
+    fn move_highlight(&mut self, down: bool, cx: &mut Context<Self>) {
+        let next = if down {
+            (self.highlighted + 1..self.hits.len()).find(|&row| self.hits[row].opens())
+        } else {
+            (0..self.highlighted)
+                .rev()
+                .find(|&row| self.hits[row].opens())
+        };
+        if let Some(next) = next {
+            self.highlighted = next;
+            self.hit_scroll
+                .scroll_to_item(next, ScrollStrategy::Center);
+            cx.notify();
+        }
+    }
+
+    fn open_hit(&mut self, row: usize, cx: &mut Context<Self>) {
+        let (file, line) = match self.hits.get(row) {
+            Some(Hit::File { file, .. }) => (*file, None),
+            Some(Hit::Line(hit)) => (hit.file, Some(hit.line)),
+            _ => return,
+        };
+        if let Some(file) = self.index.get(file) {
+            self.highlighted = row;
+            cx.emit(FileTreeEvent::OpenFile(file.path.clone(), line));
+            cx.notify();
+        }
+    }
+
+    fn render_hit(
+        &self,
+        row: usize,
+        search_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let base = div()
+            .id(("file-hit", row))
+            .h(theme::ROW_HEIGHT)
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .pr_2();
+        let file_of = |index: usize| self.index.get(index);
+        let content = match &self.hits[row] {
+            Hit::Heading(label) => {
+                return base
+                    .pl(px(10.))
+                    .text_size(px(10.5))
+                    .text_color(theme::text_faint())
+                    .child(label.clone());
+            }
+            Hit::File { file, opens } => {
+                let (name, folder) = file_of(*file)
+                    .map(|file| (file.name().to_string(), file.folder().to_string()))
+                    .unwrap_or_default();
+                base.pl(px(10.))
+                    .text_color(if *opens {
+                        theme::text_muted()
+                    } else {
+                        theme::text()
+                    })
+                    .child(icon("file", px(14.), theme::text_faint()))
+                    .child(div().flex_none().child(SharedString::from(name)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child(SharedString::from(folder)),
+                    )
+            }
+            Hit::Line(hit) => {
+                let marks = hit.found.clone().map(|range| {
+                    (
+                        range,
+                        HighlightStyle {
+                            background_color: Some(find::match_color()),
+                            color: Some(theme::text().into()),
+                            ..HighlightStyle::default()
+                        },
+                    )
+                });
+                base.pl(px(30.))
+                    .text_color(theme::text_muted())
+                    .child(
+                        div()
+                            .flex_none()
+                            .min_w(px(22.))
+                            .text_size(px(11.))
+                            .text_color(theme::text_faint())
+                            .child(SharedString::from(hit.line.to_string())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(theme::MONO_FONT)
+                            .text_size(px(11.5))
+                            .child(
+                                StyledText::new(SharedString::from(hit.text.clone()))
+                                    .with_highlights(marks),
+                            ),
+                    )
+            }
+        };
+        if !self.hits[row].opens() {
+            return content;
+        }
+        content
+            .cursor_pointer()
+            .when(search_focused && row == self.highlighted, |row| {
+                row.bg(theme::bg_hover())
+            })
+            .hover(|style| style.bg(theme::bg_hover()))
+            .on_click(cx.listener(move |this, _, _, cx| this.open_hit(row, cx)))
+    }
+
+    fn render_results(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.hits.is_empty() {
+            let message = if self.indexing || self.searching_text || self.indexed_at.is_none() {
+                "Searching…"
+            } else {
+                "No files or text match"
+            };
+            return div()
+                .p_3()
+                .text_color(theme::text_faint())
+                .child(message)
+                .into_any_element();
+        }
+        uniform_list(
+            "file-hits",
+            self.hits.len(),
+            cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                let search_focused = this.search.focus_handle(cx).is_focused(window);
+                range
+                    .map(|row| this.render_hit(row, search_focused, cx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(self.hit_scroll.clone())
+        .size_full()
+        .into_any_element()
     }
 
     /// Highlights `path`, expanding its ancestors and scrolling it into view.
@@ -382,30 +729,98 @@ impl FileTree {
 
 impl Render for FileTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.rows.is_empty() {
+        let searching = !self.search.read(cx).text().trim().is_empty();
+        let body = if searching {
+            self.render_results(cx)
+        } else if self.rows.is_empty() {
             let message = if self.loading.is_empty() {
                 "Empty folder"
             } else {
                 "Loading…"
             };
-            return div()
-                .size_full()
+            div()
                 .p_3()
                 .text_color(theme::text_faint())
                 .child(message)
-                .into_any_element();
+                .into_any_element()
+        } else {
+            uniform_list(
+                "file-tree",
+                self.rows.len(),
+                cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                    range
+                        .map(|index| this.render_row(index, cx))
+                        .collect::<Vec<_>>()
+                }),
+            )
+            .track_scroll(self.scroll.clone())
+            .size_full()
+            .into_any_element()
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_none()
+                    .mx(px(8.))
+                    .mt(px(2.))
+                    .mb(px(4.))
+                    .h(px(28.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .rounded(px(6.))
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::border())
+                    .child(icon("search", px(13.), theme::text_faint()))
+                    .child(self.search.clone()),
+            )
+            .child(div().flex_1().min_h_0().child(body))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(file: usize, line: u32) -> LineHit {
+        LineHit {
+            file,
+            line,
+            text: String::new(),
+            found: None,
         }
-        uniform_list(
-            "file-tree",
-            self.rows.len(),
-            cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                range
-                    .map(|index| this.render_row(index, cx))
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .track_scroll(self.scroll.clone())
-        .size_full()
-        .into_any_element()
+    }
+
+    /// One letter per row: `h`eading, `f`ile to open, file `n`ame over its
+    /// lines, `l`ine.
+    fn shape(rows: &[Hit]) -> String {
+        rows.iter()
+            .map(|row| match row {
+                Hit::Heading(_) => 'h',
+                Hit::File { opens: true, .. } => 'f',
+                Hit::File { opens: false, .. } => 'n',
+                Hit::Line(_) => 'l',
+            })
+            .collect()
+    }
+
+    #[test]
+    fn results_group_names_then_lines_by_file() {
+        let rows = result_rows(&[4, 2], vec![line(1, 3), line(1, 9), line(5, 1)]);
+        assert_eq!(shape(&rows), "hffhnllnl");
+        // Headings and the names over lines are not things to open.
+        assert_eq!(
+            rows.iter().map(Hit::opens).collect::<Vec<_>>(),
+            vec![false, true, true, false, false, true, true, false, true]
+        );
+        assert_eq!(shape(&result_rows(&[], vec![line(0, 1)])), "hnl");
+        assert_eq!(shape(&result_rows(&[7], Vec::new())), "hf");
+        assert!(result_rows(&[], Vec::new()).is_empty());
     }
 }

@@ -36,6 +36,24 @@ searchable list.
   bookmarked chats. Right-click an agent's tab to do the same for the chat it
   is running, or to bookmark it and close the tab in one step. Marks are
   remembered and shared by every window.
+- **Ask for a chat.** Turn on **Ask** in the chat search box, describe what
+  the chat was about ("we discussed drawing the cursor in the browser
+  frontend") and press Return. A Codex agent (GPT-6-Luna, medium effort)
+  reads the text of this folder's chats and lists the ones that match, best
+  first, each with the reason it was picked. It needs the Codex CLI installed
+  and signed in, sends the text of those chats to Codex, and runs read-only
+  without leaving a chat of its own behind. Turn off **This folder** to
+  search the 300 most recent chats from everywhere; `Esc` stops a search.
+- **Search the folder.** The box above the file tree (`⌘⇧F`) finds files by
+  name as you type, and under them the lines in any file that contain the
+  text, with the match marked. `↑`/`↓` and `Enter` open a file, at the line
+  when a line was picked. Ignored files stay out of it inside a git
+  repository; lowercase searches ignore case.
+- **Markdown, formatted.** A `.md` file opens as a readable page: headings,
+  lists and task boxes, tables, quotes, highlighted code blocks, pictures
+  kept beside the file, and links that open in the browser or as a tab. The
+  **Preview** button beside the path switches to the source, with its diff;
+  `⌘F` and jumping to a line do the same.
 - **Files open where you expect.** A file picked in the sidebar opens as a
   tab in the focused pane. A path `⌘`-clicked in a terminal opens beside that
   terminal rather than on top of it, with the files already open.
@@ -161,7 +179,8 @@ for Windows. The Windows installer is described in
 | `⌃Tab` / `⌃⇧Tab` | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `⌘1`–`⌘9` | `Alt+1`–`Alt+9` | Jump to the nth terminal in the sidebar |
 | `⌘P` | `Ctrl+Shift+P` | Search chats (`↑`/`↓` to move, `Enter` to open, `Esc` to leave) |
-| `⌘F` | `Ctrl+Shift+F` | Find in the terminal or file (`Enter` / `⇧Enter` to step, `Esc` to close) |
+| `⌘⇧F` | `Alt+Shift+F` | Search the folder's files by name and by text |
+| `⌘F` | `Ctrl+Shift+F` | Find in the terminal or file (`Enter` / `⇧Enter` to step, `Esc` to close); with nothing open, search the folder |
 | `⌘G` / `⌘⇧G` | `F3` / `Shift+F3` | Next / previous match |
 | `⌘B` | `Ctrl+Shift+B` | Toggle the sidebar |
 | `⌘H` / `⌘M` | | Hide Nexus / minimize the window |
@@ -189,7 +208,10 @@ onto a terminal pastes their paths.
 | `links.rs` | Finds file paths and URLs in a line of terminal text |
 | `sessions.rs` | Discovers Claude Code and Codex chats on disk |
 | `session_list.rs` | The searchable chat list |
+| `chat_search.rs` | Finding chats by description with a Codex agent |
 | `file_tree.rs`, `file_view.rs` | File explorer and viewer |
+| `file_search.rs` | Finding files by name and lines by text |
+| `markdown.rs` | Reading Markdown and drawing it as a page |
 | `diff.rs` | Line diff and the git baseline a file is compared against |
 | `layout.rs`, `pane.rs` | The split tree and tabbed panes |
 | `workspace.rs` | A workspace window: title bar, sidebar, actions, saving and restoring its layout |
@@ -224,7 +246,8 @@ cargo test
 
 Unit tests cover the non-UI logic: path detection, key and mouse encoding,
 session-log parsing, chat filtering, line diffing, the pane layout tree,
-saved-state round trips, theme contrast, find matching, version comparison,
+saved-state round trips, theme contrast, find matching, file search, reading
+Markdown, reducing chat logs to text for the agent, version comparison,
 swapping the app during an update, shell arguments and quoting, and the
 hand-over between two copies of the app. They run on macOS and Windows.
 

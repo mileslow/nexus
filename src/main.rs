@@ -5,8 +5,10 @@
 
 mod app_state;
 mod assets;
+mod chat_search;
 mod chrome;
 mod diff;
+mod file_search;
 mod file_tree;
 mod file_view;
 mod find;
@@ -15,6 +17,7 @@ mod home;
 mod instance;
 mod layout;
 mod links;
+mod markdown;
 mod pane;
 mod platform;
 mod session_list;
@@ -38,7 +41,7 @@ use app_state::Store;
 use update::Updater;
 use workspace::{
     CloseTab, NewClaude, NewCodex, NewTerminal, NewWindow, NextPane, NextTab, OpenFolder, PrevPane,
-    PrevTab, Quit, SearchChats, SelectTerminal1, SelectTerminal2, SelectTerminal3, SelectTerminal4,
+    PrevTab, Quit, SearchChats, SearchFiles, SelectTerminal1, SelectTerminal2, SelectTerminal3, SelectTerminal4,
     SelectTerminal5, SelectTerminal6, SelectTerminal7, SelectTerminal8, SelectTerminal9, SplitDown,
     SplitRight, ToggleSidebar,
 };
@@ -99,6 +102,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new(keys("cmd-[", "alt-left"), PrevPane, None),
         KeyBinding::new(keys("cmd-b", "ctrl-shift-b"), ToggleSidebar, None),
         KeyBinding::new(keys("cmd-p", "ctrl-shift-p"), SearchChats, None),
+        KeyBinding::new(keys("cmd-shift-f", "alt-shift-f"), SearchFiles, None),
         KeyBinding::new(keys("cmd-o", "ctrl-shift-o"), OpenFolder, None),
         KeyBinding::new(keys("cmd-q", "ctrl-shift-q"), Quit, None),
         KeyBinding::new(keys("cmd-1", "alt-1"), SelectTerminal1, None),
@@ -113,7 +117,6 @@ fn bind_keys(cx: &mut App) {
     ]);
     if cfg!(target_os = "macos") {
         cx.bind_keys([
-            KeyBinding::new("cmd-shift-f", SearchChats, None),
             KeyBinding::new("cmd-h", Hide, None),
             KeyBinding::new("alt-cmd-h", HideOthers, None),
             KeyBinding::new("cmd-m", Minimize, None),
@@ -168,6 +171,7 @@ fn menus() -> Vec<Menu> {
             name: "View".into(),
             items: vec![
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::action("Search Files", SearchFiles),
                 MenuItem::action("Search Chats", SearchChats),
                 MenuItem::separator(),
                 MenuItem::action("Split Right", SplitRight),

@@ -17,7 +17,7 @@ use crate::app_state::{SavedAxis, SavedChat, SavedLayout, SavedNode, SavedTab, S
 use crate::assets::icon;
 use crate::chrome::{self, AppMenu};
 use crate::file_tree::{FileTree, FileTreeEvent};
-use crate::file_view::FileView;
+use crate::file_view::{FileView, FileViewEvent};
 use crate::find::{Find, FindNext, FindPrevious};
 use crate::home::display_path;
 use crate::layout::{Direction, Node};
@@ -48,6 +48,7 @@ actions!(
         PrevPane,
         ToggleSidebar,
         SearchChats,
+        SearchFiles,
         OpenFolder,
         NewWindow,
         Quit,
@@ -164,9 +165,10 @@ impl Workspace {
             &file_tree,
             window,
             |this, _, event: &FileTreeEvent, window, cx| match event {
-                FileTreeEvent::OpenFile(path) => {
-                    this.open_file(path.clone(), None, FilePlacement::ActivePane, window, cx)
+                FileTreeEvent::OpenFile(path, line) => {
+                    this.open_file(path.clone(), *line, FilePlacement::ActivePane, window, cx)
                 }
+                FileTreeEvent::Dismissed => this.focus_active_pane(window, cx),
             },
         )
         .detach();
@@ -438,9 +440,7 @@ impl Workspace {
                         }
                         SavedTab::File { path } => {
                             if path.is_file() {
-                                let root = self.root.clone();
-                                let view =
-                                    cx.new(|cx| FileView::new(path.clone(), &root, None, cx));
+                                let view = self.new_file_view(path.clone(), None, window, cx);
                                 pane.update(cx, |pane, cx| {
                                     pane.add_item(PaneItem::File(view), window, cx)
                                 });
@@ -713,6 +713,32 @@ impl Workspace {
         pane
     }
 
+    /// A viewer for `path`, with the links in it wired up.
+    fn new_file_view(
+        &mut self,
+        path: PathBuf,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<FileView> {
+        let root = self.root.clone();
+        let view = cx.new(|cx| FileView::new(path, &root, line, cx));
+        cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &FileViewEvent, window, cx| match event {
+                FileViewEvent::OpenPath(path) if path.is_dir() => {
+                    this.file_tree.update(cx, |tree, cx| tree.reveal(path, cx))
+                }
+                FileViewEvent::OpenPath(path) => {
+                    this.open_file(path.clone(), None, FilePlacement::ActivePane, window, cx)
+                }
+            },
+        )
+        .detach();
+        view
+    }
+
     pub fn open_file(
         &mut self,
         path: PathBuf,
@@ -738,8 +764,7 @@ impl Workspace {
         }
 
         let target = self.file_target(placement, window, cx);
-        let root = self.root.clone();
-        let view = cx.new(|cx| FileView::new(path.clone(), &root, line, cx));
+        let view = self.new_file_view(path.clone(), line, window, cx);
         target.update(cx, |pane, cx| {
             pane.add_item(PaneItem::File(view), window, cx)
         });
@@ -1731,7 +1756,8 @@ impl Workspace {
                 terminal.update(cx, |terminal, cx| terminal.open_find(window, cx))
             }
             Some(PaneItem::File(file)) => file.update(cx, |file, cx| file.open_find(window, cx)),
-            None => {}
+            // Nothing open to search in: search the folder's files instead.
+            None => self.search_files(&SearchFiles, window, cx),
         }
     }
 
@@ -1792,6 +1818,13 @@ impl Workspace {
         cx.notify();
     }
 
+    fn search_files(&mut self, _: &SearchFiles, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = true;
+        self.collapsed[SECTION_FILES] = false;
+        window.focus(&self.file_tree.focus_handle(cx));
+        cx.notify();
+    }
+
     fn search_chats(&mut self, _: &SearchChats, window: &mut Window, cx: &mut Context<Self>) {
         self.sidebar_visible = true;
         self.collapsed[SECTION_CHATS] = false;
@@ -1838,6 +1871,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prev_pane))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::search_chats))
+            .on_action(cx.listener(Self::search_files))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(|this, _: &SelectTerminal1, window, cx| {
                 this.select_terminal(0, window, cx)

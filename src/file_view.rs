@@ -5,6 +5,7 @@
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
@@ -12,9 +13,9 @@ use std::time::SystemTime;
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
-    combine_highlights, div, img, point, prelude::*, px, uniform_list, App, ClipboardItem, Context,
-    Entity, FocusHandle, Focusable, HighlightStyle, Hsla, ListHorizontalSizingBehavior, ObjectFit,
-    Pixels, Rgba, ScrollStrategy, SharedString, StyledText, Task, UniformListScrollHandle, Window,
+    combine_highlights, div, img, list, point, prelude::*, px, uniform_list, AnyElement, App,
+    ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, Hsla,
+    ListAlignment, ListHorizontalSizingBehavior, ListState, ObjectFit, Pixels, Rgba, ScrollStrategy, SharedString, StyledText, Task, UniformListScrollHandle, Window,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
@@ -23,6 +24,7 @@ use syntect::parsing::SyntaxSet;
 use crate::assets::icon;
 use crate::diff::{self, Baseline, Diff, RowKind};
 use crate::find::{self, FindBar, FindEvent};
+use crate::markdown::{self, Target};
 use crate::theme;
 
 const MAX_FILE_BYTES: u64 = 24 * 1024 * 1024;
@@ -31,6 +33,17 @@ const MAX_HIGHLIGHT_LINES: usize = 40_000;
 const HIGHLIGHT_CHUNK: usize = 400;
 const LINE_HEIGHT: f32 = 19.;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg"];
+const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "mdx"];
+/// A Markdown file bigger than this opens as its source; the formatted
+/// page lays out all of it at once.
+const MAX_PREVIEW_BYTES: u64 = 1024 * 1024;
+/// Code blocks longer than this are left uncolored.
+const MAX_CODE_BLOCK_BYTES: usize = 256 * 1024;
+
+pub enum FileViewEvent {
+    /// A link in the file points at this file or folder.
+    OpenPath(PathBuf),
+}
 
 type LineHighlights = Arc<[(Range<usize>, Hsla)]>;
 type Lines = Arc<Vec<SharedString>>;
@@ -109,9 +122,20 @@ pub struct FileView {
     /// Measured while drawing, to bring a match on a long line into view.
     gutter_width: Pixels,
     char_width: Pixels,
+    /// Whether this is a Markdown file, which can be shown formatted.
+    is_markdown: bool,
+    /// Show the formatted page rather than the source.
+    preview: bool,
+    /// The file read as Markdown, once that is done.
+    markdown: Option<markdown::Document>,
+    /// The formatted page: one row for each top-level block.
+    page: ListState,
     _load: Option<Task<()>>,
     _highlight: Option<Task<()>>,
+    _markdown: Option<Task<()>>,
 }
+
+impl EventEmitter<FileViewEvent> for FileView {}
 
 impl Focusable for FileView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -216,6 +240,66 @@ fn syntax_theme() -> &'static Theme {
             })
         }
     }
+}
+
+fn rgba(color: syntect::highlighting::Color) -> Rgba {
+    Rgba {
+        r: color.r as f32 / 255.,
+        g: color.g as f32 / 255.,
+        b: color.b as f32 / 255.,
+        a: 1.,
+    }
+}
+
+/// Colors for a block of code in a named language, as byte ranges of it.
+pub fn highlight_code(language: &str, text: &str) -> Vec<(Range<usize>, Hsla)> {
+    let mut spans: Vec<(Range<usize>, Hsla)> = Vec::new();
+    let set = syntaxes();
+    let syntax = set
+        .find_syntax_by_token(language)
+        .filter(|syntax| syntax.name != "Plain Text");
+    let Some(syntax) = syntax.filter(|_| !language.is_empty() && text.len() <= MAX_CODE_BLOCK_BYTES)
+    else {
+        return spans;
+    };
+    let syntax_theme = syntax_theme();
+    let default_color = syntax_theme.settings.foreground.map(rgba);
+    let mut highlighter = HighlightLines::new(syntax, syntax_theme);
+    let mut buffer = String::new();
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        // The highlighter wants every line to end with a line break.
+        buffer.clear();
+        buffer.push_str(line);
+        if !line.ends_with('\n') {
+            buffer.push('\n');
+        }
+        if let Ok(regions) = highlighter.highlight_line(&buffer, set) {
+            let mut offset = line_start;
+            for (style, piece) in regions {
+                let end = (offset + piece.len()).min(line_start + line.len());
+                let color = rgba(style.foreground);
+                if end > offset && Some(color) != default_color {
+                    let color: Hsla = color.into();
+                    match spans.last_mut() {
+                        Some((range, last)) if range.end == offset && *last == color => {
+                            range.end = end
+                        }
+                        _ => spans.push((offset..end, color)),
+                    }
+                }
+                offset += piece.len();
+            }
+        }
+        line_start += line.len();
+    }
+    spans
+}
+
+fn is_markdown(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        MARKDOWN_EXTENSIONS.contains(&extension.to_string_lossy().to_lowercase().as_str())
+    })
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
@@ -471,7 +555,14 @@ impl FileView {
         let focus_handle = cx.focus_handle();
         let find_bar = cx.new(|cx| FindBar::new(focus_handle.clone(), false, cx));
         cx.subscribe(&find_bar, Self::on_find_event).detach();
+        let is_markdown = is_markdown(&path);
+        let small = fs::metadata(&path).is_ok_and(|meta| meta.len() <= MAX_PREVIEW_BYTES);
         let mut this = Self {
+            is_markdown,
+            preview: is_markdown && small,
+            markdown: None,
+            page: ListState::new(0, ListAlignment::Top, px(600.)),
+            _markdown: None,
             path,
             display_path: display_path.into(),
             focus_handle,
@@ -546,6 +637,8 @@ impl FileView {
             return;
         };
         let index = line as usize - 1;
+        // A line number means the source, not the formatted page.
+        self.preview = false;
         self.highlighted_line = Some(index);
         if matches!(self.content, Content::Text(_)) {
             self.scroll
@@ -560,6 +653,8 @@ impl FileView {
 
     /// Opens the find bar, or returns to it if it is already open.
     pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Find searches the source, and marks what it finds there.
+        self.preview = false;
         self.find_open = true;
         self.find_bar.update(cx, |bar, cx| bar.focus(window, cx));
         self.refresh_find(true, cx);
@@ -734,6 +829,58 @@ impl FileView {
         cx.notify();
     }
 
+    /// Reads the file as Markdown again, off the UI thread.
+    fn read_markdown(&mut self, cx: &mut Context<Self>) {
+        if !self.is_markdown {
+            return;
+        }
+        let path = self.path.clone();
+        self._markdown = Some(cx.spawn(async move |this, cx| {
+            let document = cx
+                .background_spawn(async move {
+                    let bytes = fs::read(&path).unwrap_or_default();
+                    markdown::parse(&String::from_utf8_lossy(&bytes), &highlight_code)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // A file that changed while open keeps its place on screen.
+                let top = this.page.logical_scroll_top();
+                this.page.reset(document.blocks.len());
+                this.page.scroll_to(top);
+                this.markdown = Some(document);
+                cx.notify();
+            });
+        }));
+    }
+
+    fn render_page_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(document) = &self.markdown else {
+            return div().into_any_element();
+        };
+        let this = cx.weak_entity();
+        let open: markdown::OpenLink = Rc::new(move |address, _, cx| {
+            let _ = this.update(cx, |this, cx| this.follow_link(address, cx));
+        });
+        let folder = self.path.parent().unwrap_or(Path::new(""));
+        markdown::render_block(document, index, folder, open)
+    }
+
+    /// Switches a Markdown file between the formatted page and its source.
+    fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview = !self.preview;
+        cx.notify();
+    }
+
+    /// Goes where a link in the formatted page points.
+    fn follow_link(&mut self, address: &str, cx: &mut Context<Self>) {
+        let folder = self.path.parent().unwrap_or(Path::new(""));
+        match markdown::target(address, folder) {
+            Target::Url(url) => cx.open_url(&url),
+            Target::File(path) if path.exists() => cx.emit(FileViewEvent::OpenPath(path)),
+            Target::File(_) | Target::Anchor => {}
+        }
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         let opened = self.opened.clone();
@@ -769,6 +916,9 @@ impl FileView {
                 })
             }
         };
+        if matches!(self.content, Content::Text(_)) {
+            self.read_markdown(cx);
+        }
         // The set of changes may be different now, and so may the matches.
         self.hunk_cursor = None;
         if self.find_open {
@@ -1106,11 +1256,24 @@ impl Render for FileView {
                 text.highlights = vec![None; text.lines.len()];
                 let lines = text.lines.clone();
                 self.start_highlighting(lines, cx);
+                self.read_markdown(cx);
             } else {
                 self.highlight_theme = theme::active_index();
             }
         }
+        let previewing = self.preview && matches!(self.content, Content::Text(_));
+        let page = previewing.then(|| match &self.markdown {
+            Some(_) => list(
+                self.page.clone(),
+                cx.processor(|this, index: usize, _window, cx| this.render_page_row(index, cx)),
+            )
+            .size_full()
+            .into_any_element(),
+            // Still being read.
+            None => div().into_any_element(),
+        });
         let body = match &self.content {
+            _ if page.is_some() => page.unwrap_or_else(|| div().into_any_element()),
             Content::Loading => div().into_any_element(),
             Content::Message(message) => div()
                 .size_full()
@@ -1159,7 +1322,33 @@ impl Render for FileView {
                 .into_any_element()
             }
         };
-        let change_bar = self.render_change_bar(cx);
+        // The change controls step through the source.
+        let change_bar = if previewing {
+            None
+        } else {
+            self.render_change_bar(cx)
+        };
+        let preview_toggle = self.is_markdown.then(|| {
+            div()
+                .id("toggle-preview")
+                .flex_none()
+                .h(px(18.))
+                .px(px(7.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .map(|chip| {
+                    if self.preview {
+                        chip.bg(theme::bg_active()).text_color(theme::text())
+                    } else {
+                        chip.text_color(theme::text_muted())
+                            .hover(|style| style.bg(theme::bg_hover()))
+                    }
+                })
+                .child("Preview")
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx)))
+        });
         let find_bar = self.find_open.then(|| {
             div()
                 .absolute()
@@ -1198,7 +1387,8 @@ impl Render for FileView {
                             .on_click(cx.listener(|this, _, _, cx| this.copy_path(cx))),
                     )
                     .child(div().flex_1())
-                    .children(change_bar),
+                    .children(change_bar)
+                    .children(preview_toggle),
             )
             .child(
                 div()

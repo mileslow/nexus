@@ -108,6 +108,11 @@ impl TextInput {
         &self.content
     }
 
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
+
     /// Selects the whole text, so typing replaces it.
     pub fn select_everything(&mut self, cx: &mut Context<Self>) {
         self.selection_reversed = false;

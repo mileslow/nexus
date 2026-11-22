@@ -9,7 +9,7 @@ use gpui::{
 use crate::assets::icon;
 use crate::theme;
 use crate::update::{self, Updater};
-use crate::workspace::{NewWindow, OpenFolder, SearchChats, ToggleSidebar};
+use crate::workspace::{NewWindow, OpenFolder, SearchChats, SearchFiles, ToggleSidebar};
 
 /// True where the app draws its own title bar buttons and menu.
 pub const CUSTOM: bool = cfg!(windows);
@@ -91,6 +91,7 @@ impl AppMenu {
             Entry::Run("New Window", "Ctrl+Shift+N", Box::new(NewWindow)),
             Entry::Run("Open Folder…", "Ctrl+Shift+O", Box::new(OpenFolder)),
             Entry::Separator,
+            Entry::Run("Search Files", "Alt+Shift+F", Box::new(SearchFiles)),
             Entry::Run("Search Chats", "Ctrl+Shift+P", Box::new(SearchChats)),
             Entry::Run("Find…", "Ctrl+Shift+F", Box::new(crate::find::Find)),
             Entry::Run("Toggle Sidebar", "Ctrl+Shift+B", Box::new(ToggleSidebar)),
