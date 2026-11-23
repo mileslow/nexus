@@ -54,6 +54,11 @@ searchable list.
   kept beside the file, and links that open in the browser or as a tab. The
   **Preview** button beside the path switches to the source, with its diff;
   `⌘F` and jumping to a line do the same.
+- **Text you can copy.** Drag over the text of a file, in the formatted page
+  or in the source, to select it. A double-click takes a word, a triple-click
+  a line, and `⇧`-click carries the selection to the pointer; dragging past
+  the top or bottom scrolls. `⌘C` copies it, lists and tables included, and
+  `⌘A` selects everything.
 - **Files open where you expect.** A file picked in the sidebar opens as a
   tab in the focused pane. A path `⌘`-clicked in a terminal opens beside that
   terminal rather than on top of it, with the files already open.
@@ -186,6 +191,7 @@ for Windows. The Windows installer is described in
 | `⌘H` / `⌘M` | | Hide Nexus / minimize the window |
 | `⌘`-click | `Ctrl`-click | Open the path or URL under the pointer |
 | `⌘C` / `⌘V` / `⌘K` | `Ctrl+Shift+C` / `Ctrl+Shift+V` / `Ctrl+Shift+K` | Copy selection / paste / clear the terminal |
+| `⌘C` / `⌘A` | `Ctrl+C` / `Ctrl+A` | In a file: copy the selected text / select all of it |
 | `⇧PageUp` / `⇧PageDown` | same | Scroll back through terminal history |
 | `⇧Enter` | same | Insert a newline in an agent prompt |
 | Right-click a terminal | same | Copy the selected text, split up / right / down / left, or close it |
@@ -213,6 +219,7 @@ onto a terminal pastes their paths.
 | `file_search.rs` | Finding files by name and lines by text |
 | `markdown.rs` | Reading Markdown and drawing it as a page |
 | `diff.rs` | Line diff and the git baseline a file is compared against |
+| `selection.rs` | Selecting the text of a file with the mouse: what a press or a drag covers, and painting it |
 | `layout.rs`, `pane.rs` | The split tree and tabbed panes |
 | `workspace.rs` | A workspace window: title bar, sidebar, actions, saving and restoring its layout |
 | `home.rs`, `windows.rs` | The home view, and opening windows |
@@ -247,7 +254,8 @@ cargo test
 Unit tests cover the non-UI logic: path detection, key and mouse encoding,
 session-log parsing, chat filtering, line diffing, the pane layout tree,
 saved-state round trips, theme contrast, find matching, file search, reading
-Markdown, reducing chat logs to text for the agent, version comparison,
+Markdown, what a text selection covers and copies, reducing chat logs to text
+for the agent, version comparison,
 swapping the app during an update, shell arguments and quoting, and the
 hand-over between two copies of the app. They run on macOS and Windows.
 

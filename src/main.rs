@@ -20,6 +20,7 @@ mod links;
 mod markdown;
 mod pane;
 mod platform;
+mod selection;
 mod session_list;
 mod sessions;
 mod terminal;
@@ -86,6 +87,7 @@ fn bind_keys(cx: &mut App) {
     text_input::bind_keys(cx);
     find::bind_keys(cx);
     terminal::bind_keys(cx);
+    file_view::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new(keys("cmd-shift-n", "ctrl-shift-n"), NewWindow, None),
         KeyBinding::new(keys("cmd-t", "ctrl-shift-t"), NewTerminal, None),

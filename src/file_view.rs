@@ -5,7 +5,6 @@
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
@@ -13,9 +12,12 @@ use std::time::SystemTime;
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
-    combine_highlights, div, img, list, point, prelude::*, px, uniform_list, AnyElement, App,
-    ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, Hsla,
-    ListAlignment, ListHorizontalSizingBehavior, ListState, ObjectFit, Pixels, Rgba, ScrollStrategy, SharedString, StyledText, Task, UniformListScrollHandle, Window,
+    actions, canvas, combine_highlights, div, img, list, point, prelude::*, px, uniform_list,
+    AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase, Entity, EventEmitter,
+    FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, ListAlignment,
+    ListHorizontalSizingBehavior, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, Pixels, Rgba, ScrollStrategy, SharedString, StyledText, Task,
+    UniformListScrollHandle, Window,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
@@ -25,7 +27,21 @@ use crate::assets::icon;
 use crate::diff::{self, Baseline, Diff, RowKind};
 use crate::find::{self, FindBar, FindEvent};
 use crate::markdown::{self, Target};
+use crate::platform::keys;
+use crate::selection::{self, Selection};
+use crate::terminal;
 use crate::theme;
+
+actions!(file_view, [SelectAll]);
+
+pub fn bind_keys(cx: &mut App) {
+    let ctx = Some("FileView");
+    cx.bind_keys([
+        // The same Copy the Edit menu offers.
+        KeyBinding::new(keys("cmd-c", "ctrl-c"), terminal::Copy, ctx),
+        KeyBinding::new(keys("cmd-a", "ctrl-a"), SelectAll, ctx),
+    ]);
+}
 
 const MAX_FILE_BYTES: u64 = 24 * 1024 * 1024;
 const MAX_LINE_CHARS: usize = 3000;
@@ -130,6 +146,9 @@ pub struct FileView {
     markdown: Option<markdown::Document>,
     /// The formatted page: one row for each top-level block.
     page: ListState,
+    /// The text selected with the mouse, in whichever of the page and the
+    /// source is showing.
+    selection: Selection,
     _load: Option<Task<()>>,
     _highlight: Option<Task<()>>,
     _markdown: Option<Task<()>>,
@@ -562,6 +581,7 @@ impl FileView {
             preview: is_markdown && small,
             markdown: None,
             page: ListState::new(0, ListAlignment::Top, px(600.)),
+            selection: Selection::default(),
             _markdown: None,
             path,
             display_path: display_path.into(),
@@ -638,7 +658,7 @@ impl FileView {
         };
         let index = line as usize - 1;
         // A line number means the source, not the formatted page.
-        self.preview = false;
+        self.set_preview(false);
         self.highlighted_line = Some(index);
         if matches!(self.content, Content::Text(_)) {
             self.scroll
@@ -654,7 +674,7 @@ impl FileView {
     /// Opens the find bar, or returns to it if it is already open.
     pub fn open_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Find searches the source, and marks what it finds there.
-        self.preview = false;
+        self.set_preview(false);
         self.find_open = true;
         self.find_bar.update(cx, |bar, cx| bar.focus(window, cx));
         self.refresh_find(true, cx);
@@ -795,6 +815,8 @@ impl FileView {
             changes.diff.row_of_line[line] as usize
         };
         self.show_diff = !self.show_diff;
+        // The rows it was made on are not the rows showing now.
+        self.selection.clear();
         self.scroll
             .scroll_to_item_strict(new_top, ScrollStrategy::Top);
         cx.notify();
@@ -848,27 +870,144 @@ impl FileView {
                 this.page.reset(document.blocks.len());
                 this.page.scroll_to(top);
                 this.markdown = Some(document);
+                if this.preview {
+                    this.selection.clear();
+                }
                 cx.notify();
             });
         }));
     }
 
-    fn render_page_row(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_page_row(&self, index: usize) -> AnyElement {
         let Some(document) = &self.markdown else {
             return div().into_any_element();
         };
-        let this = cx.weak_entity();
-        let open: markdown::OpenLink = Rc::new(move |address, _, cx| {
-            let _ = this.update(cx, |this, cx| this.follow_link(address, cx));
-        });
         let folder = self.path.parent().unwrap_or(Path::new(""));
-        markdown::render_block(document, index, folder, open)
+        markdown::render_block(document, index, folder, &self.selection)
+    }
+
+    /// Shows the formatted page or the source. A selection made in one
+    /// means nothing in the other.
+    fn set_preview(&mut self, preview: bool) {
+        if self.preview != preview {
+            self.preview = preview;
+            self.selection.clear();
+        }
     }
 
     /// Switches a Markdown file between the formatted page and its source.
     fn toggle_preview(&mut self, cx: &mut Context<Self>) {
-        self.preview = !self.preview;
+        self.set_preview(!self.preview);
         cx.notify();
+    }
+
+    // ---- selection ------------------------------------------------------------
+
+    /// Whether the formatted page, rather than the source, is showing.
+    fn previewing(&self) -> bool {
+        self.preview && matches!(self.content, Content::Text(_))
+    }
+
+    fn on_mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        self.selection
+            .press(event.position, event.click_count, event.modifiers.shift);
+        cx.notify();
+    }
+
+    /// Carries the selection to where the mouse was dragged. `bounds` is
+    /// the area the text is shown in.
+    fn on_drag(&mut self, event: &MouseMoveEvent, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+        if !self.selection.is_dragging() {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            // The button was let go where the window did not hear of it.
+            self.selection.release(event.position);
+            return;
+        }
+        // Dragging past the top or bottom scrolls on to more of the text.
+        let y = event.position.y;
+        let past = (y - bounds.bottom()).max(px(0.)) + (y - bounds.top()).min(px(0.));
+        if past != px(0.) {
+            if self.previewing() {
+                self.page.scroll_by(past);
+            } else {
+                let handle = self.scroll.0.borrow().base_handle.clone();
+                let offset = handle.offset();
+                let top = (offset.y - past).clamp(-handle.max_offset().height, px(0.));
+                handle.set_offset(point(offset.x, top));
+            }
+        }
+        if self.selection.drag(event.position) || past != px(0.) {
+            cx.notify();
+        }
+    }
+
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        if !self.selection.is_dragging() {
+            return;
+        }
+        // Pressing and letting go of a link, without selecting, follows it.
+        if let Some(address) = self.selection.release(event.position) {
+            self.follow_link(&address, cx);
+        }
+        cx.notify();
+    }
+
+    /// The text of a row of the source: a line of the file or, among its
+    /// changes, one that was removed from it.
+    fn row_text<'a>(&'a self, text: &'a TextContent, row: usize) -> Option<&'a SharedString> {
+        let Some(changes) = self.shown_changes() else {
+            return text.lines.get(row);
+        };
+        let shown = changes.diff.rows.get(row)?;
+        match shown.kind {
+            RowKind::Removed => changes.base.get(shown.index as usize),
+            _ => text.lines.get(shown.index as usize),
+        }
+    }
+
+    /// The text selected with the mouse, if any.
+    fn selected_text(&self) -> Option<String> {
+        let selected = self.selection.range()?;
+        let Content::Text(text) = &self.content else {
+            return None;
+        };
+        if self.preview {
+            return Some(self.markdown.as_ref()?.text_between(&selected));
+        }
+        let rows = match self.shown_changes() {
+            Some(changes) => changes.diff.rows.len(),
+            None => text.lines.len(),
+        };
+        let mut out = String::new();
+        for row in selected.start.row..rows.min(selected.end.row.saturating_add(1)) {
+            let Some(line) = self.row_text(text, row) else {
+                break;
+            };
+            let Some(part) = selection::part(&selected, row, 0, line) else {
+                continue;
+            };
+            out.push_str(&line[part.range]);
+            if part.continues && row + 1 < rows {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
+    fn copy(&mut self, _: &terminal::Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.selected_text().filter(|text| !text.is_empty()) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.content, Content::Text(_)) {
+            self.selection.select_all();
+            cx.notify();
+        }
     }
 
     /// Goes where a link in the formatted page points.
@@ -898,6 +1037,8 @@ impl FileView {
         self.git_stamp = snapshot.git_stamp;
         self.cancel_highlight.store(true, Ordering::Relaxed);
         self._highlight = None;
+        // What was selected may not be there any more.
+        self.selection.clear();
         self.content = match snapshot.loaded {
             Loaded::Image => Content::Image,
             Loaded::Message(message) => Content::Message(message),
@@ -1061,6 +1202,7 @@ impl FileView {
                     Some(index) if !self.find_matches.is_empty() => self.matches_on_line(index),
                     _ => (0, &[][..]),
                 };
+                let line = content.clone();
                 let styled = if found.is_empty() {
                     match spans {
                         Some(_) => StyledText::new(content).with_highlights(syntax),
@@ -1160,7 +1302,7 @@ impl FileView {
                             .when(kind == RowKind::Removed, |line| {
                                 line.text_color(theme::text_muted())
                             })
-                            .child(styled),
+                            .child(self.selection.text(row_index, 0, line, styled)),
                     )
             })
             .collect()
@@ -1261,11 +1403,13 @@ impl Render for FileView {
                 self.highlight_theme = theme::active_index();
             }
         }
-        let previewing = self.preview && matches!(self.content, Content::Text(_));
+        let previewing = self.previewing();
+        // The text is about to say where it is drawn this time.
+        self.selection.begin_frame();
         let page = previewing.then(|| match &self.markdown {
             Some(_) => list(
                 self.page.clone(),
-                cx.processor(|this, index: usize, _window, cx| this.render_page_row(index, cx)),
+                cx.processor(|this, index: usize, _window, _cx| this.render_page_row(index)),
             )
             .size_full()
             .into_any_element(),
@@ -1357,6 +1501,30 @@ impl Render for FileView {
                 .child(self.find_bar.clone())
         });
 
+        // Once a drag has begun it is followed wherever the pointer goes,
+        // which an element only hears about while the pointer is over it.
+        let view = cx.weak_entity();
+        let drag = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                let dragged = view.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble {
+                        let _ = dragged.update(cx, |this, cx| this.on_drag(event, bounds, cx));
+                    }
+                });
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase == DispatchPhase::Bubble && event.button == MouseButton::Left {
+                        let _ = view.update(cx, |this, cx| this.on_mouse_up(event, cx));
+                    }
+                });
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full();
+
         div()
             .size_full()
             .flex()
@@ -1364,6 +1532,8 @@ impl Render for FileView {
             .bg(theme::bg_app())
             .track_focus(&self.focus_handle)
             .key_context("FileView")
+            .on_action(cx.listener(Self::copy))
+            .on_action(cx.listener(Self::select_all))
             .child(
                 div()
                     .h(px(26.))
@@ -1398,7 +1568,9 @@ impl Render for FileView {
                     .text_size(theme::MONO_TEXT_SIZE)
                     .text_color(theme::text())
                     .relative()
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
                     .child(body)
+                    .child(drag)
                     .children(find_bar),
             )
     }

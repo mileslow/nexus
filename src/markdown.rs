@@ -2,16 +2,16 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    div, font, img, prelude::*, px, relative, AnyElement, App, Font, FontStyle, FontWeight,
-    HighlightStyle, Hsla, InteractiveText, SharedString, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, Window,
+    div, font, img, prelude::*, px, relative, AnyElement, Font, FontStyle, FontWeight,
+    HighlightStyle, Hsla, SharedString, StrikethroughStyle, StyledText, TextRun, UnderlineStyle,
 };
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::assets::icon;
+use crate::selection::{self, Place, Selection};
 use crate::theme;
 
 /// Colors for part of a code block, as byte ranges of its text.
@@ -496,6 +496,102 @@ fn html_blocks(html: &str, out: &mut Vec<Block>) {
     flush(&mut text, out);
 }
 
+/// What stands for a picture where only text will do.
+fn image_label<'a>(source: &'a str, alt: &'a str) -> &'a str {
+    if alt.is_empty() {
+        source
+    } else {
+        alt
+    }
+}
+
+/// One of the pieces of text a block is drawn as.
+struct Piece<'a> {
+    text: &'a str,
+    /// What parts it from the piece before, when both are copied.
+    gap: &'static str,
+    /// The mark a list puts in front of it.
+    marker: String,
+}
+
+/// Lists the pieces of `blocks` in the order the painter draws them, which
+/// is how a selection numbers them. `gap` parts each block from the last;
+/// `depth` counts the lists around them.
+fn pieces<'a>(blocks: &'a [Block], gap: &'static str, depth: usize, out: &mut Vec<Piece<'a>>) {
+    let piece = |text: &'a str, gap| Piece {
+        text,
+        gap,
+        marker: String::new(),
+    };
+    for block in blocks {
+        let first = out.len();
+        match block {
+            Block::Heading { text, .. } | Block::Paragraph(text) => out.push(piece(&text.text, gap)),
+            Block::Code { text, .. } => out.push(piece(text, gap)),
+            Block::Image { source, alt } => out.push(piece(image_label(source, alt), gap)),
+            Block::Quote(blocks) => pieces(blocks, "\n\n", depth, out),
+            Block::List { start, items } => {
+                for (index, item) in items.iter().enumerate() {
+                    let first = out.len();
+                    pieces(&item.blocks, "\n", depth + 1, out);
+                    let Some(piece) = out.get_mut(first) else {
+                        continue;
+                    };
+                    let marker = match (item.checked, start) {
+                        (Some(true), _) => "- [x] ".to_string(),
+                        (Some(false), _) => "- [ ] ".to_string(),
+                        (None, Some(first)) => format!("{}. ", first + index as u64),
+                        (None, None) => "- ".to_string(),
+                    };
+                    piece.marker = format!("{}{marker}", "  ".repeat(depth));
+                    piece.gap = "\n";
+                }
+            }
+            Block::Table { head, rows } => {
+                let filled = (!head.is_empty()).then_some(head);
+                for cells in filled.into_iter().chain(rows) {
+                    for (column, cell) in cells.iter().enumerate() {
+                        out.push(piece(&cell.text, if column == 0 { "\n" } else { "\t" }));
+                    }
+                }
+            }
+            Block::Rule => {}
+        }
+        if let Some(piece) = out.get_mut(first) {
+            piece.gap = gap;
+        }
+    }
+}
+
+impl Document {
+    /// The text a selection covers, as it would be typed out plainly.
+    pub fn text_between(&self, selected: &Range<Place>) -> String {
+        let mut out = String::new();
+        let mut copied_any = false;
+        let rows = self.blocks.iter().enumerate().skip(selected.start.row);
+        for (row, block) in rows.take_while(|(row, _)| *row <= selected.end.row) {
+            let mut row_pieces = Vec::new();
+            pieces(std::slice::from_ref(block), "\n\n", 0, &mut row_pieces);
+            for (index, piece) in row_pieces.iter().enumerate() {
+                let Some(part) = selection::part(selected, row, index, piece.text) else {
+                    continue;
+                };
+                if copied_any {
+                    out.push_str(piece.gap);
+                }
+                // A list item's mark comes with it when more than that one
+                // piece is copied.
+                if part.range.start == 0 && (copied_any || part.continues) {
+                    out.push_str(&piece.marker);
+                }
+                copied_any = true;
+                out.push_str(&piece.text[part.range]);
+            }
+        }
+        out
+    }
+}
+
 /// What a link or picture address points at.
 #[derive(Debug, PartialEq)]
 pub enum Target {
@@ -567,14 +663,14 @@ const CODE_SIZE: f32 = 12.5;
 const PAGE_WIDTH: f32 = 820.;
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
 
-/// Called with the address of a link that was clicked.
-pub type OpenLink = Rc<dyn Fn(&str, &mut Window, &mut App)>;
-
 struct Painter<'a> {
     folder: &'a Path,
-    open: OpenLink,
-    /// Numbers the pieces that need an identity of their own.
-    next_id: usize,
+    /// Makes the text selectable, and knows what is selected of it.
+    selection: &'a Selection,
+    /// The row being drawn, and how many pieces of its text have been.
+    /// [`pieces`] lists them in the same order.
+    row: usize,
+    next_piece: usize,
     /// The color of plain text where the painter is.
     color: Hsla,
 }
@@ -585,15 +681,20 @@ struct Painter<'a> {
 /// The page is a list of these rows rather than one tall column: a list
 /// gives each row a known width to wrap its text at, and draws only the
 /// rows in view.
-pub fn render_block(document: &Document, index: usize, folder: &Path, open: OpenLink) -> AnyElement {
+pub fn render_block(
+    document: &Document,
+    index: usize,
+    folder: &Path,
+    selection: &Selection,
+) -> AnyElement {
     let Some(block) = document.blocks.get(index) else {
         return div().into_any_element();
     };
     let mut painter = Painter {
         folder,
-        open,
-        // Rows are drawn one by one; their pieces must not share numbers.
-        next_id: index * 100_000,
+        selection,
+        row: index,
+        next_piece: 0,
         color: theme::text().into(),
     };
     div()
@@ -615,9 +716,10 @@ pub fn render_block(document: &Document, index: usize, folder: &Path, open: Open
 }
 
 impl Painter<'_> {
-    fn id(&mut self) -> usize {
-        self.next_id += 1;
-        self.next_id
+    /// The number of the next piece of text in the row.
+    fn piece(&mut self) -> usize {
+        self.next_piece += 1;
+        self.next_piece - 1
     }
 
     fn blocks(&mut self, blocks: &[Block]) -> Vec<AnyElement> {
@@ -652,27 +754,31 @@ impl Painter<'_> {
                 .w_full()
                 .child(self.inline(text, FontWeight::NORMAL))
                 .into_any_element(),
-            Block::Code { text, colors } => div()
-                .id(("markdown-code", self.id()))
-                .w_full()
-                .overflow_x_scroll()
-                .px(px(12.))
-                .py(px(9.))
-                .rounded(px(6.))
-                .bg(theme::bg_input())
-                .border_1()
-                .border_color(theme::border())
-                .font_family(theme::MONO_FONT)
-                .text_size(px(CODE_SIZE))
-                .line_height(relative(1.5))
-                .whitespace_nowrap()
-                .child(
-                    StyledText::new(text.clone())
-                        .with_highlights(colors.iter().map(|(range, color)| {
-                            (range.clone(), HighlightStyle::color(*color))
-                        })),
-                )
-                .into_any_element(),
+            Block::Code { text, colors } => {
+                let piece = self.piece();
+                let styled = StyledText::new(text.clone()).with_highlights(
+                    colors
+                        .iter()
+                        .map(|(range, color)| (range.clone(), HighlightStyle::color(*color))),
+                );
+                div()
+                    // Rows are drawn one by one; their boxes must not share numbers.
+                    .id(("markdown-code", self.row * 100_000 + piece))
+                    .w_full()
+                    .overflow_x_scroll()
+                    .px(px(12.))
+                    .py(px(9.))
+                    .rounded(px(6.))
+                    .bg(theme::bg_input())
+                    .border_1()
+                    .border_color(theme::border())
+                    .font_family(theme::MONO_FONT)
+                    .text_size(px(CODE_SIZE))
+                    .line_height(relative(1.5))
+                    .whitespace_nowrap()
+                    .child(self.selection.text(self.row, piece, text.clone(), styled))
+                    .into_any_element()
+            }
             Block::Quote(blocks) => {
                 let outside = std::mem::replace(&mut self.color, theme::text_muted().into());
                 let inside = self.blocks(blocks);
@@ -815,6 +921,8 @@ impl Painter<'_> {
                 IMAGE_EXTENSIONS.contains(&extension.to_string_lossy().to_lowercase().as_str())
             });
             if known && path.is_file() {
+                // The picture stands where its description would be.
+                self.piece();
                 return div()
                     .w_full()
                     .flex()
@@ -822,7 +930,7 @@ impl Painter<'_> {
                     .into_any_element();
             }
         }
-        let label = if alt.is_empty() { source } else { alt };
+        let label = image_label(source, alt);
         let link = Inline {
             text: label.to_string().into(),
             spans: vec![Span {
@@ -843,13 +951,15 @@ impl Painter<'_> {
             .into_any_element()
     }
 
-    /// Styled text, with its links clickable.
+    /// Styled text that can be selected, with its links marked.
     fn inline(&mut self, inline: &Inline, weight: FontWeight) -> AnyElement {
+        let piece = self.piece();
         // Left to inherit: plain text needs nothing worked out.
         if inline.spans.is_empty() {
+            let styled = StyledText::new(inline.text.clone());
             return div()
                 .font_weight(weight)
-                .child(inline.text.clone())
+                .child(self.selection.text(self.row, piece, inline.text.clone(), styled))
                 .into_any_element();
         }
         let color = self.color;
@@ -857,7 +967,7 @@ impl Painter<'_> {
             weight,
             ..font(theme::UI_FONT)
         };
-        let run = |len: usize, style: &Style| {
+        let run = |len: usize, style: &Style, filled: bool| {
             let mut font = base.clone();
             if style.bold {
                 font.weight = FontWeight::BOLD;
@@ -876,7 +986,7 @@ impl Painter<'_> {
                 } else {
                     color
                 },
-                background_color: style.code.then(|| theme::bg_active().into()),
+                background_color: (style.code && filled).then(|| theme::bg_active().into()),
                 underline: style.link.as_ref().map(|_| UnderlineStyle {
                     thickness: px(1.),
                     color: None,
@@ -893,11 +1003,25 @@ impl Painter<'_> {
         let mut runs = Vec::new();
         let mut links: Vec<(Range<usize>, Arc<str>)> = Vec::new();
         let mut at = 0;
+        // Code gives up its own background where it is selected, which
+        // would otherwise cover the selection's.
+        let selected = self
+            .selection
+            .part(self.row, piece, &inline.text)
+            .map_or(0..0, |part| part.range);
         for span in &inline.spans {
             if span.range.start > at {
-                runs.push(run(span.range.start - at, &plain));
+                runs.push(run(span.range.start - at, &plain, true));
             }
-            runs.push(run(span.range.len(), &span.style));
+            let bare = selected.start.clamp(span.range.start, span.range.end)
+                ..selected.end.clamp(span.range.start, span.range.end);
+            if span.style.code && !bare.is_empty() {
+                runs.push(run(bare.start - span.range.start, &span.style, true));
+                runs.push(run(bare.len(), &span.style, false));
+                runs.push(run(span.range.end - bare.end, &span.style, true));
+            } else {
+                runs.push(run(span.range.len(), &span.style, true));
+            }
             at = span.range.end;
             if let Some(link) = &span.style.link {
                 match links.last_mut() {
@@ -910,19 +1034,14 @@ impl Painter<'_> {
             }
         }
         if at < inline.text.len() {
-            runs.push(run(inline.text.len() - at, &plain));
+            runs.push(run(inline.text.len() - at, &plain, true));
         }
+        runs.retain(|run| run.len > 0);
 
-        let text = StyledText::new(inline.text.clone()).with_runs(runs);
-        if links.is_empty() {
-            return text.into_any_element();
-        }
-        let (ranges, addresses): (Vec<_>, Vec<_>) = links.into_iter().unzip();
-        let open = self.open.clone();
-        InteractiveText::new(("markdown-text", self.id()), text)
-            .on_click(ranges, move |index, window, cx| {
-                open(&addresses[index], window, cx)
-            })
+        let styled = StyledText::new(inline.text.clone()).with_runs(runs);
+        self.selection
+            .text(self.row, piece, inline.text.clone(), styled)
+            .links(links)
             .into_any_element()
     }
 }
@@ -1085,6 +1204,34 @@ mod tests {
         );
         assert_eq!(attribute("<img data-src=no src=yes.png>", "src").as_deref(), Some("yes.png"));
         assert_eq!(attribute("<img alt='x'>", "src"), None);
+    }
+
+    #[test]
+    fn a_selection_copies_as_plain_text() {
+        let document = parse(
+            "# Title\n\nSome **bold** text.\n\n3. first\n4. second\n   - [x] inner\n\n\
+             | a | b |\n|---|---|\n| 1 | 2 |\n\n```\nlet x = 1;\nlet y = 2;\n```\n\n> said\n",
+            &|_, _| Vec::new(),
+        );
+        let place = |row, piece, offset| Place { row, piece, offset };
+        let copy = |from, to| document.text_between(&(from..to));
+        assert_eq!(
+            copy(Place::default(), Place::END),
+            "Title\n\nSome bold text.\n\n3. first\n4. second\n  - [x] inner\n\n\
+             a\tb\n1\t2\n\nlet x = 1;\nlet y = 2;\n\nsaid"
+        );
+        // Part of one piece, and from inside one block into the next.
+        assert_eq!(copy(place(1, 0, 5), place(1, 0, 9)), "bold");
+        assert_eq!(copy(place(0, 0, 2), place(1, 0, 4)), "tle\n\nSome");
+        // A list item taken from partway in has lost its mark, and so has
+        // one copied alone.
+        assert_eq!(copy(place(2, 0, 2), place(2, 1, 3)), "rst\n4. sec");
+        assert_eq!(copy(place(2, 0, 0), place(2, 0, 5)), "first");
+        // Across the cells of a table.
+        assert_eq!(copy(place(3, 1, 0), place(3, 3, 1)), "b\n1\t2");
+        // Ending at the very start of a block takes nothing from it.
+        assert_eq!(copy(place(0, 0, 0), place(1, 0, 0)), "Title");
+        assert_eq!(copy(place(9, 0, 0), Place::END), "");
     }
 
     #[test]
