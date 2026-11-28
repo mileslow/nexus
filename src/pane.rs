@@ -1,7 +1,7 @@
 //! A pane: a strip of tabs over one visible terminal or file.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     div, prelude::*, px, AnyElement, App, Bounds, Context, DragMoveEvent, Entity, EntityId,
@@ -68,6 +68,8 @@ pub enum PaneEvent {
     ContextMenu {
         position: Point<Pixels>,
         item: EntityId,
+        /// The file or folder named by the text under the pointer.
+        path: Option<PathBuf>,
     },
     /// A tab in this pane's header was right-clicked.
     TabMenu {
@@ -317,10 +319,13 @@ impl Pane {
                         cx.notify();
                     }
                     TerminalEvent::Open(target) => cx.emit(PaneEvent::Open(target.clone())),
-                    TerminalEvent::ContextMenu(position) => cx.emit(PaneEvent::ContextMenu {
-                        position: *position,
-                        item: terminal.entity_id(),
-                    }),
+                    TerminalEvent::ContextMenu { position, path } => {
+                        cx.emit(PaneEvent::ContextMenu {
+                            position: *position,
+                            item: terminal.entity_id(),
+                            path: path.clone(),
+                        })
+                    }
                 },
             );
             self.subscriptions

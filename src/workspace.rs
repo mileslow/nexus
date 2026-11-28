@@ -17,10 +17,10 @@ use crate::app_state::{SavedAxis, SavedChat, SavedLayout, SavedNode, SavedTab, S
 use crate::assets::icon;
 use crate::chrome::{self, AppMenu};
 use crate::file_tree::{FileTree, FileTreeEvent};
-use crate::file_view::{FileView, FileViewEvent};
+use crate::file_view::{self, FileView, FileViewEvent, Opening};
 use crate::find::{Find, FindNext, FindPrevious};
 use crate::home::display_path;
-use crate::layout::{Direction, Node};
+use crate::layout::{boundary_share, Direction, Node};
 use crate::links::{self, LinkTarget};
 use crate::pane::{
     icon_button, status_color, terminal_glyph, Pane, PaneEvent, PaneItem, TabPlacement,
@@ -69,6 +69,9 @@ const TICK: Duration = Duration::from_millis(700);
 const SAVE_EVERY: usize = 3;
 const SIDEBAR_MIN: f32 = 190.;
 const SIDEBAR_MAX: f32 = 620.;
+const SECTION_HEADER: f32 = 28.;
+/// Shortest the file tree or the chat list may be dragged to.
+const SECTION_MIN: f32 = 72.;
 
 const SECTION_TERMINALS: usize = 0;
 const SECTION_FILES: usize = 1;
@@ -77,6 +80,9 @@ const SECTION_CHATS: usize = 2;
 #[derive(Clone, Copy)]
 enum MenuChoice {
     Copy,
+    /// Show the menu's file or folder in the system's file manager.
+    Reveal,
+    CopyPath,
     Split(Direction),
     Close,
     /// Bookmark the tab's chat, or take the bookmark off.
@@ -95,6 +101,9 @@ enum MenuOrigin {
     SidebarRow,
     /// A tab in a pane's header: bookmark or pin its chat, close.
     TabHeader,
+    /// A file or folder, in the sidebar or above an open file: show it in
+    /// the file manager, copy its path.
+    Path,
 }
 
 /// Where a file that is not open yet gets its tab.
@@ -115,6 +124,9 @@ struct SplitDrag {
 /// Drag payload for the sidebar's right edge.
 struct SidebarDrag;
 
+/// Drag payload for the boundary between the file tree and the chat list.
+struct SectionDrag;
+
 pub struct Workspace {
     root: PathBuf,
     focus_handle: FocusHandle,
@@ -127,6 +139,8 @@ pub struct Workspace {
     sidebar_width: Pixels,
     sidebar_visible: bool,
     collapsed: [bool; 3],
+    /// The share of the height Files and Chats divide that goes to Files.
+    files_share: f32,
     next_split_id: usize,
     window_active: bool,
     /// The right-click menu for a terminal, while it is open.
@@ -150,6 +164,9 @@ struct ItemMenu {
     runs_agent: bool,
     /// The id of the chat that agent has open, once it can be told.
     chat: Option<String>,
+    /// The file or folder the menu is about: the path that was
+    /// right-clicked, or the file a tab shows.
+    path: Option<PathBuf>,
 }
 
 impl Focusable for Workspace {
@@ -169,6 +186,9 @@ impl Workspace {
                     this.open_file(path.clone(), *line, FilePlacement::ActivePane, window, cx)
                 }
                 FileTreeEvent::Dismissed => this.focus_active_pane(window, cx),
+                FileTreeEvent::Menu { position, path } => {
+                    this.open_path_menu(*position, path.clone(), cx)
+                }
             },
         )
         .detach();
@@ -223,6 +243,7 @@ impl Workspace {
             sidebar_width: px(280.),
             sidebar_visible: true,
             collapsed: [false; 3],
+            files_share: 0.5,
             next_split_id: 0,
             window_active: true,
             item_menu: None,
@@ -265,6 +286,7 @@ impl Workspace {
             sidebar_width: f32::from(self.sidebar_width),
             sidebar_visible: self.sidebar_visible,
             collapsed: self.collapsed,
+            files_share: self.files_share,
             tree,
             active_pane: self
                 .panes()
@@ -396,6 +418,9 @@ impl Workspace {
         self.sidebar_width = px(layout.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX));
         self.sidebar_visible = layout.sidebar_visible;
         self.collapsed = layout.collapsed;
+        if layout.files_share.is_finite() {
+            self.files_share = layout.files_share.clamp(0.05, 0.95);
+        }
         self.center = self.restore_node(&layout.tree, window, cx);
 
         let panes = self.panes();
@@ -439,7 +464,8 @@ impl Workspace {
                             self.spawn_terminal(&pane, Some(options), window, cx);
                         }
                         SavedTab::File { path } => {
-                            if path.is_file() {
+                            // Coming back must not start other programs.
+                            if path.is_file() && file_view::opening_for(path) == Opening::Here {
                                 let view = self.new_file_view(path.clone(), None, window, cx);
                                 pane.update(cx, |pane, cx| {
                                     pane.add_item(PaneItem::File(view), window, cx)
@@ -726,9 +752,13 @@ impl Workspace {
         cx.subscribe_in(
             &view,
             window,
-            |this, _, event: &FileViewEvent, window, cx| match event {
+            |this, view, event: &FileViewEvent, window, cx| match event {
                 FileViewEvent::OpenPath(path) if path.is_dir() => {
                     this.file_tree.update(cx, |tree, cx| tree.reveal(path, cx))
+                }
+                FileViewEvent::PathMenu(position) => {
+                    let path = view.read(cx).path().to_path_buf();
+                    this.open_path_menu(*position, path, cx)
                 }
                 FileViewEvent::OpenPath(path) => {
                     this.open_file(path.clone(), None, FilePlacement::ActivePane, window, cx)
@@ -748,6 +778,13 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let path = links::normalize(&path);
+        // What the viewer cannot show goes to the program the system has
+        // for it; a program is only pointed at, never run.
+        match file_view::opening_for(&path) {
+            Opening::Here => {}
+            Opening::System => return cx.open_with_system(&path),
+            Opening::Reveal => return cx.reveal_path(&path),
+        }
         for pane in self.panes() {
             let existing = pane.read(cx).index_of_file(&path, cx);
             if let Some(index) = existing {
@@ -825,17 +862,34 @@ impl Workspace {
             }
             PaneEvent::Open(target) => self.open_link(target, pane, window, cx),
             PaneEvent::Split(direction) => self.split_pane(pane, *direction, window, cx),
-            PaneEvent::ContextMenu { position, item } => {
+            PaneEvent::ContextMenu {
+                position,
+                item,
+                path,
+            } => self.open_item_menu(
+                *position,
+                pane.clone(),
+                *item,
+                MenuOrigin::TerminalText,
+                path.clone(),
+                cx,
+            ),
+            PaneEvent::TabMenu { position, item } => {
+                // A file's tab is about that file.
+                let path = pane.read(cx).items().iter().find_map(|tab| match tab {
+                    PaneItem::File(file) if file.entity_id() == *item => {
+                        Some(file.read(cx).path().to_path_buf())
+                    }
+                    _ => None,
+                });
                 self.open_item_menu(
                     *position,
                     pane.clone(),
                     *item,
-                    MenuOrigin::TerminalText,
+                    MenuOrigin::TabHeader,
+                    path,
                     cx,
                 )
-            }
-            PaneEvent::TabMenu { position, item } => {
-                self.open_item_menu(*position, pane.clone(), *item, MenuOrigin::TabHeader, cx)
             }
             PaneEvent::TabDropped {
                 item,
@@ -956,6 +1010,7 @@ impl Workspace {
         pane: Entity<Pane>,
         item: EntityId,
         origin: MenuOrigin,
+        path: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
         let terminal = {
@@ -982,8 +1037,17 @@ impl Workspace {
             selection,
             runs_agent,
             chat,
+            path,
         });
         cx.notify();
+    }
+
+    /// Opens the menu for a file or folder that is not a tab.
+    fn open_path_menu(&mut self, position: Point<Pixels>, path: PathBuf, cx: &mut Context<Self>) {
+        // The menu belongs to no tab; its rows only use the path.
+        let pane = self.active_pane.clone();
+        let item = pane.entity_id();
+        self.open_item_menu(position, pane, item, MenuOrigin::Path, Some(path), cx);
     }
 
     fn dismiss_item_menu(&mut self, cx: &mut Context<Self>) {
@@ -1008,6 +1072,23 @@ impl Workspace {
             (MenuChoice::Copy, _) => {
                 if let Some(text) = menu.selection {
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                return;
+            }
+            (MenuChoice::Reveal, _) => {
+                if let Some(path) = &menu.path {
+                    // Something that has since gone is shown by the nearest
+                    // folder that is still there.
+                    let shown = path.ancestors().find(|path| path.exists());
+                    cx.reveal_path(shown.unwrap_or(path));
+                }
+                return;
+            }
+            (MenuChoice::CopyPath, _) => {
+                if let Some(path) = &menu.path {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        path.to_string_lossy().into_owned(),
+                    ));
                 }
                 return;
             }
@@ -1113,9 +1194,28 @@ impl Workspace {
             })
         };
         let close = || row("menu-close", "close", "Close", Some(MenuChoice::Close));
+        // What can be done with the menu's file or folder.
+        let path_rows = || {
+            [
+                row(
+                    "menu-reveal",
+                    "folder-open",
+                    crate::platform::reveal_label(),
+                    Some(MenuChoice::Reveal),
+                ),
+                row("menu-copy-path", "copy", "Copy Path", Some(MenuChoice::CopyPath)),
+            ]
+        };
 
         let mut rows: Vec<AnyElement> = Vec::new();
+        if menu.path.is_some() {
+            rows.extend(path_rows());
+            if menu.origin != MenuOrigin::Path {
+                rows.push(separator());
+            }
+        }
         match menu.origin {
+            MenuOrigin::Path => {}
             MenuOrigin::TerminalText => {
                 let copy = menu.selection.is_some().then_some(MenuChoice::Copy);
                 rows.push(row("menu-copy", "copy", "Copy", copy));
@@ -1282,7 +1382,7 @@ impl Workspace {
         };
         div()
             .id(("section", section))
-            .h(px(28.))
+            .h(px(SECTION_HEADER))
             .flex_none()
             .flex()
             .items_center()
@@ -1403,6 +1503,7 @@ impl Workspace {
                                     menu_pane.clone(),
                                     terminal_id,
                                     MenuOrigin::SidebarRow,
+                                    None,
                                     cx,
                                 )
                             }),
@@ -1455,6 +1556,9 @@ impl Workspace {
             }))
             .into_any_element()];
 
+        let files_open = !self.collapsed[SECTION_FILES];
+        let chats_open = !self.collapsed[SECTION_CHATS];
+
         div()
             .relative()
             .w(self.sidebar_width)
@@ -1485,36 +1589,77 @@ impl Workspace {
                         .children(terminal_rows),
                 )
             })
-            .child(self.render_section_header(SECTION_FILES, "FILES", root_name, file_actions, cx))
-            .when(!self.collapsed[SECTION_FILES], |sidebar| {
-                sidebar.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .child(self.file_tree.clone()),
-                )
-            })
-            .child(self.render_section_header(
-                SECTION_CHATS,
-                "CHATS",
-                chat_detail,
-                chat_actions,
-                cx,
-            ))
-            .when(!self.collapsed[SECTION_CHATS], |sidebar| {
-                sidebar.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .child(self.sessions.clone()),
-                )
-            })
-            // Keeps collapsed sections stacked at the top.
-            .when(
-                self.collapsed[SECTION_FILES] && self.collapsed[SECTION_CHATS],
-                |sidebar| sidebar.child(div().flex_1()),
+            .child(
+                // Files and Chats divide whatever height the terminals leave.
+                div()
+                    .id("sidebar-sections")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.render_section_header(
+                        SECTION_FILES,
+                        "FILES",
+                        root_name,
+                        file_actions,
+                        cx,
+                    ))
+                    .when(files_open, |sections| {
+                        sections.child(
+                            section_body(if chats_open { self.files_share } else { 1. })
+                                .child(self.file_tree.clone()),
+                        )
+                    })
+                    .child(
+                        div()
+                            .relative()
+                            .flex_none()
+                            .child(self.render_section_header(
+                                SECTION_CHATS,
+                                "CHATS",
+                                chat_detail,
+                                chat_actions,
+                                cx,
+                            ))
+                            // With both lists showing, the line between them drags.
+                            .when(files_open && chats_open, |header| {
+                                header.child(
+                                    div()
+                                        .id("section-resize")
+                                        .absolute()
+                                        .left_0()
+                                        .right_0()
+                                        .top(px(-4.))
+                                        .h(px(7.))
+                                        // Keeps the header under it from taking
+                                        // the press as a click to collapse.
+                                        .occlude()
+                                        .cursor_row_resize()
+                                        .on_drag(SectionDrag, |_, _, _, cx| cx.new(|_| EmptyView)),
+                                )
+                            }),
+                    )
+                    .when(chats_open, |sections| {
+                        sections.child(
+                            section_body(if files_open { 1. - self.files_share } else { 1. })
+                                .child(self.sessions.clone()),
+                        )
+                    })
+                    .on_drag_move::<SectionDrag>(cx.listener(
+                        |this, event: &DragMoveEvent<SectionDrag>, _, cx| {
+                            // The two headers keep their height; the lists share the rest.
+                            let top = event.bounds.top() + px(SECTION_HEADER);
+                            let extent = f32::from(event.bounds.size.height) - SECTION_HEADER * 2.;
+                            let offset = f32::from(event.event.position.y - top);
+                            let Some(share) = boundary_share(offset, extent, SECTION_MIN) else {
+                                return;
+                            };
+                            if share != this.files_share {
+                                this.files_share = share;
+                                cx.notify();
+                            }
+                        },
+                    )),
             )
             .child(
                 div()
@@ -1923,6 +2068,15 @@ impl Render for Workspace {
             )
             .children(self.render_item_menu(cx))
     }
+}
+
+/// The scrolling part of a sidebar section, given `share` of the height the
+/// open sections divide.
+fn section_body(share: f32) -> gpui::Div {
+    let mut body = div().flex_1().min_h_0().overflow_hidden();
+    // Scaled up so the shares always claim all of the spare height.
+    body.style().flex_grow = Some(share * 100.);
+    body
 }
 
 fn window_title(root: &Path) -> String {

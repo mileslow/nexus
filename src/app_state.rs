@@ -77,9 +77,16 @@ pub struct SavedLayout {
     pub sidebar_width: f32,
     pub sidebar_visible: bool,
     pub collapsed: [bool; 3],
+    /// The share of the height Files and Chats divide that goes to Files.
+    #[serde(default = "even_share")]
+    pub files_share: f32,
     pub tree: SavedNode,
     /// Index of the active pane, counting panes left to right, top to bottom.
     pub active_pane: usize,
+}
+
+fn even_share() -> f32 {
+    0.5
 }
 
 impl SavedLayout {
@@ -350,6 +357,7 @@ mod tests {
             sidebar_width: 300.,
             sidebar_visible: true,
             collapsed: [false, true, false],
+            files_share: 0.3,
             tree: SavedNode::Split {
                 axis: SavedAxis::Horizontal,
                 sizes: vec![0.4, 0.6],
@@ -434,6 +442,15 @@ mod tests {
         assert_eq!(state.workspaces.len(), 1);
         assert_eq!(state.workspaces[0].root, PathBuf::from("/old/project"));
         assert_eq!(AppState::parse(b"not json"), AppState::default());
+        // A layout saved before the sidebar's sections could be resized.
+        let state = AppState::parse(
+            br#"{"workspaces": [{"root": "/a", "last_opened": 1, "layout": {
+                "sidebar_width": 280.0, "sidebar_visible": true,
+                "collapsed": [false, false, false],
+                "tree": {"kind": "pane", "tabs": [], "active": 0}, "active_pane": 0}}]}"#,
+        );
+        let layout = state.layout_for(Path::new("/a")).expect("layout");
+        assert_eq!(layout.files_share, 0.5);
         // Unknown fields from a newer version are ignored.
         let state = AppState::parse(br#"{"theme": "Nord", "future": 1}"#);
         assert_eq!(state.theme.as_deref(), Some("Nord"));

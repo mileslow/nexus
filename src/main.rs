@@ -301,6 +301,10 @@ fn main() {
             }
         })
         .detach();
+        // Quitting closes every terminal. This runs once they are closed, so
+        // their shells are hung up in their own time before the app is gone.
+        cx.on_app_quit(|_| async { terminal::finish_hang_ups() })
+            .detach();
 
         // Folders the app was launched to open are already waiting.
         let mut requested: Vec<PathBuf> = requested.into_iter().collect();

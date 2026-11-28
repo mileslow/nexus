@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
@@ -61,6 +61,42 @@ pub fn bind_keys(cx: &mut App) {
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 const MAX_LINK_ROWS: usize = 24;
+
+/// How long a shell that is still starting up gets to finish the command it
+/// is in the middle of before it is hung up.
+const STARTUP_SETTLE: Duration = Duration::from_secs(2);
+/// A shell this old is taken to have finished starting, whatever it runs.
+const STARTUP_LIMIT: Duration = Duration::from_secs(120);
+
+/// How many shells are being hung up on a thread of their own.
+static HANGING_UP: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// Counts one shell in `HANGING_UP` for as long as it lives.
+struct HangingUp;
+
+impl HangingUp {
+    fn begin() -> Self {
+        *HANGING_UP.0.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Self
+    }
+}
+
+impl Drop for HangingUp {
+    fn drop(&mut self) {
+        *HANGING_UP.0.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        HANGING_UP.1.notify_all();
+    }
+}
+
+/// Waits for the shells that are in the middle of being hung up. The app
+/// calls this on its way out: exiting sooner would end them wherever they
+/// are, which is what waiting for a quiet moment is there to avoid.
+pub fn finish_hang_ups() {
+    let (count, changed) = &HANGING_UP;
+    let pending = count.lock().unwrap_or_else(|e| e.into_inner());
+    let limit = STARTUP_SETTLE + Duration::from_millis(250);
+    let _ = changed.wait_timeout_while(pending, limit, |pending| *pending > 0);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TermSize {
@@ -114,7 +150,11 @@ pub enum TerminalEvent {
     Closed,
     Open(LinkTarget),
     /// Right-clicked at this window position.
-    ContextMenu(Point<Pixels>),
+    ContextMenu {
+        position: Point<Pixels>,
+        /// The file or folder named by the text that was right-clicked.
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,7 +221,7 @@ pub struct TerminalView {
     pub session_id: Option<String>,
     initial_cwd: PathBuf,
     workspace_root: PathBuf,
-    processes: proc::Watch,
+    processes: Arc<proc::Watch>,
     foreground_pid: i32,
     process_name: String,
     process_cwd: Option<PathBuf>,
@@ -190,6 +230,8 @@ pub struct TerminalView {
     focused: bool,
     last_output: Instant,
     last_input: Instant,
+    /// Whether anything has been typed, pasted or dropped here.
+    had_input: bool,
     working_since: Option<Instant>,
     status: Status,
 
@@ -219,12 +261,13 @@ impl Focusable for TerminalView {
 impl Drop for TerminalView {
     fn drop(&mut self) {
         if !self.exited {
-            // Hang up the shell (which hangs up its own jobs), but leave the
-            // reader thread running: it keeps draining output, so nothing
-            // blocks on a full PTY while exiting, and it stops by itself once
-            // the shell is gone. Stopping it first can leave the shell stuck
-            // mid-exit for many seconds.
-            self.processes.hang_up();
+            // A shell closed while its startup files are still running is
+            // not cut off in the middle of one of their commands.
+            let settle = if self.starting() {
+                STARTUP_SETTLE
+            } else {
+                Duration::ZERO
+            };
             // Programs that ignore the hang-up must not keep the reader
             // alive forever. On Windows closing the terminal is what ends
             // them, so there is nothing to wait for.
@@ -233,8 +276,17 @@ impl Drop for TerminalView {
             } else {
                 Duration::from_secs(3)
             };
+            let processes = self.processes.clone();
             let pty_tx = self.pty_tx.clone();
+            let hanging_up = HangingUp::begin();
             std::thread::spawn(move || {
+                // Hang up the shell (which hangs up its own jobs), but leave
+                // the reader thread running: it keeps draining output, so
+                // nothing blocks on a full PTY while exiting, and it stops by
+                // itself once the shell is gone. Stopping it first can leave
+                // the shell stuck mid-exit for many seconds.
+                processes.hang_up_between_commands(settle);
+                drop(hanging_up);
                 std::thread::sleep(grace);
                 let _ = pty_tx.send(Msg::Shutdown);
             });
@@ -283,7 +335,7 @@ impl TerminalView {
 
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let pty = tty::new(&pty_options, window_size, id as u64)?;
-        let processes = proc::Watch::new(&pty);
+        let processes = Arc::new(proc::Watch::new(&pty));
         let child_pid = processes.shell_pid();
 
         let (tx, mut rx) = unbounded();
@@ -358,6 +410,7 @@ impl TerminalView {
                 focused: false,
                 last_output: now,
                 last_input: now,
+                had_input: false,
                 working_since: None,
                 status: Status::Idle,
                 selecting: false,
@@ -475,6 +528,12 @@ impl TerminalView {
             changed = true;
         }
         changed
+    }
+
+    /// Whether only the shell's own startup can have run here so far: no
+    /// agent has shown up, nothing was typed, and the tab is new.
+    fn starting(&self) -> bool {
+        !self.agent_seen && !self.had_input && self.spawned_at.elapsed() < STARTUP_LIMIT
     }
 
     /// The agent exited back to the shell: this is a plain terminal again.
@@ -608,6 +667,7 @@ impl TerminalView {
             term.selection = None;
         }
         self.last_input = Instant::now();
+        self.had_input = true;
         self.write(bytes);
         cx.notify();
     }
@@ -1109,6 +1169,15 @@ impl TerminalView {
     }
 
     /// Finds a file path or URL at a grid cell.
+    /// The file or folder named by the text at `position`, if it names one.
+    fn path_at(&self, position: Point<Pixels>) -> Option<PathBuf> {
+        let (point, _) = self.grid_point(position);
+        match self.link_at(point)?.target {
+            LinkTarget::File { path, .. } => Some(path),
+            LinkTarget::Url(_) => None,
+        }
+    }
+
     fn link_at(&self, point: AlacPoint) -> Option<HoveredLink> {
         // Copy the logical line out so no disk access happens under the lock.
         let (chars, positions, index, hyperlink) = {
@@ -1231,7 +1300,10 @@ impl Render for TerminalView {
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     window.focus(&this.focus_handle);
-                    cx.emit(TerminalEvent::ContextMenu(event.position));
+                    cx.emit(TerminalEvent::ContextMenu {
+                        position: event.position,
+                        path: this.path_at(event.position),
+                    });
                 }),
             )
             .on_mouse_move(cx.listener(Self::on_mouse_move))

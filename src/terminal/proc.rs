@@ -8,6 +8,7 @@ mod imp {
     use std::ffi::{c_char, c_int, c_void, CStr};
     use std::os::fd::{AsRawFd, RawFd};
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     use alacritty_terminal::tty::Pty;
 
@@ -49,11 +50,33 @@ mod imp {
             }
         }
 
+        /// Whether the shell itself has the terminal, rather than a command
+        /// it is waiting for.
+        pub fn shell_in_front(&self) -> bool {
+            let group = unsafe { libc::tcgetpgrp(self.fd) };
+            group <= 0 || group == self.shell
+        }
+
         /// Hangs up the shell, which hangs up its own jobs.
         pub fn hang_up(&self) {
             unsafe {
                 libc::kill(self.shell, libc::SIGHUP);
             }
+        }
+
+        /// Hangs up the shell once it is between commands, or after `limit`.
+        ///
+        /// A shell hung up while it waits for a command takes that command
+        /// down before it can tidy up. Startup files run such commands:
+        /// `pyenv rehash` cut off this way leaves its lock file behind, and
+        /// every shell started in the next minute then waits on that lock
+        /// before it shows a prompt.
+        pub fn hang_up_between_commands(&self, limit: Duration) {
+            let deadline = Instant::now() + limit;
+            while !self.shell_in_front() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            self.hang_up();
         }
     }
 
@@ -409,8 +432,8 @@ mod imp {
         }
 
         /// Closing the terminal ends what runs in it; there is nothing to
-        /// ask first.
-        pub fn hang_up(&self) {}
+        /// ask first, and nothing to wait for.
+        pub fn hang_up_between_commands(&self, _limit: Duration) {}
     }
 
     pub fn process_path(pid: i32) -> Option<PathBuf> {
@@ -544,6 +567,92 @@ mod tests {
             Some(vec!["node".to_string(), "/opt/bin/codex".to_string()])
         );
         assert_eq!(parse_procargs(&[0, 0]), None);
+    }
+
+    /// Starts a shell on a PTY the way a tab does, runs `command` in it, and
+    /// waits for that command to take the terminal.
+    #[cfg(unix)]
+    fn shell_running(command: &str) -> (alacritty_terminal::tty::Pty, Watch) {
+        use std::io::Write as _;
+        use std::time::{Duration, Instant};
+
+        use alacritty_terminal::event::WindowSize;
+        use alacritty_terminal::tty;
+
+        let options = tty::Options {
+            shell: Some(tty::Shell::new("/bin/sh".into(), vec!["-i".into()])),
+            working_directory: None,
+            drain_on_exit: false,
+            // Keeps the startup files of whoever runs the tests out of it.
+            env: [("ENV".to_string(), String::new())].into(),
+        };
+        let size = WindowSize {
+            num_lines: 24,
+            num_cols: 80,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let pty = tty::new(&options, size, 0).expect("a PTY");
+        let watch = Watch::new(&pty);
+        // Read what the shell prints, as a tab does: a shell cannot finish
+        // exiting while its output is waiting to be read.
+        let mut output = pty.file().try_clone().expect("a second handle");
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buffer = [0u8; 4096];
+            loop {
+                match output.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let mut input = pty.file();
+        input
+            .write_all(format!("{command}\n").as_bytes())
+            .expect("typing into the shell");
+        let typed = Instant::now();
+        while watch.shell_in_front() {
+            assert!(typed.elapsed() < Duration::from_secs(10), "{command} never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (pty, watch)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_is_hung_up_between_commands() {
+        use std::time::{Duration, Instant};
+
+        let (pty, watch) = shell_running("sleep 1");
+        let asked = Instant::now();
+        watch.hang_up_between_commands(Duration::from_secs(10));
+        // The shell was left alone until its command had finished.
+        let waited = asked.elapsed();
+        assert!(waited > Duration::from_millis(300), "hung up after {waited:?}");
+        assert!(waited < Duration::from_secs(5), "hung up after {waited:?}");
+        assert!(watch.shell_in_front());
+        // Dropping the PTY waits for the shell, which the hang-up has ended.
+        drop(pty);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_that_stays_busy_is_hung_up_anyway() {
+        use std::time::{Duration, Instant};
+
+        let (pty, watch) = shell_running("sleep 30");
+        let asked = Instant::now();
+        watch.hang_up_between_commands(Duration::from_millis(200));
+        let waited = asked.elapsed();
+        assert!(waited >= Duration::from_millis(200), "hung up after {waited:?}");
+        drop(pty);
+        // Neither the wait nor the shell lasted as long as the command.
+        assert!(asked.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

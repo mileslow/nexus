@@ -447,6 +447,7 @@ mod tests {
                 sidebar_width: 280.,
                 sidebar_visible: true,
                 collapsed: [false; 3],
+                files_share: 0.5,
                 tree: SavedNode::Pane { tabs, active: 0 },
                 active_pane: 0,
             }),

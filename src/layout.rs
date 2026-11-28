@@ -6,6 +6,16 @@ use gpui::Axis;
 /// Smallest share of a split one child may be dragged down to.
 const MIN_FRACTION: f32 = 0.08;
 
+/// The share of `extent` the first of two stacked sections gets when the
+/// boundary between them is dragged to `offset`. Neither section goes below
+/// `min`; `None` when there is not room for both at that size.
+pub fn boundary_share(offset: f32, extent: f32, min: f32) -> Option<f32> {
+    if !(min > 0.) || !(extent >= min * 2.) || !offset.is_finite() {
+        return None;
+    }
+    Some(offset.clamp(min, extent - min) / extent)
+}
+
 /// Where a new pane goes relative to the one being split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -270,5 +280,17 @@ mod tests {
         tree.resize(1, 0, 0.0);
         assert!((sizes(&tree)[0] - MIN_FRACTION).abs() < 1e-6);
         assert!(!tree.resize(99, 0, 0.5));
+    }
+
+    #[test]
+    fn a_dragged_boundary_keeps_both_sections_usable() {
+        assert_eq!(boundary_share(150., 600., 60.), Some(0.25));
+        // Dragging past either end stops at the minimum height.
+        assert_eq!(boundary_share(-40., 600., 60.), Some(0.1));
+        assert_eq!(boundary_share(900., 600., 60.), Some(0.9));
+        assert_eq!(boundary_share(60., 120., 60.), Some(0.5));
+        // Too short to fit both: leave the split as it was.
+        assert_eq!(boundary_share(50., 100., 60.), None);
+        assert_eq!(boundary_share(f32::NAN, 600., 60.), None);
     }
 }

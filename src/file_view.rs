@@ -59,6 +59,8 @@ const MAX_CODE_BLOCK_BYTES: usize = 256 * 1024;
 pub enum FileViewEvent {
     /// A link in the file points at this file or folder.
     OpenPath(PathBuf),
+    /// The file's path, above its content, was right-clicked here.
+    PathMenu(gpui::Point<Pixels>),
 }
 
 type LineHighlights = Arc<[(Range<usize>, Hsla)]>;
@@ -319,6 +321,65 @@ fn is_markdown(path: &Path) -> bool {
     path.extension().is_some_and(|extension| {
         MARKDOWN_EXTENSIONS.contains(&extension.to_string_lossy().to_lowercase().as_str())
     })
+}
+
+/// Where a file opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Opening {
+    /// As a tab: text, and the pictures the viewer can show.
+    Here,
+    /// In whatever program the system opens such a file with.
+    System,
+    /// Shown in the file manager: "opening" a program would run it.
+    Reveal,
+}
+
+/// Files the system runs rather than shows, which their bytes do not
+/// give away.
+const RUNNABLE_EXTENSIONS: &[&str] = &["msi", "msp", "lnk", "pif", "jar", "appref-ms"];
+
+/// Decides where a file opens from its extension (lowercase) and its
+/// first bytes.
+fn opening(extension: &str, head: &[u8]) -> Opening {
+    if IMAGE_EXTENSIONS.contains(&extension) || !head.contains(&0) {
+        return Opening::Here;
+    }
+    // Compiled programs and libraries: Windows, Linux, and the Mac's
+    // several byte orders.
+    const PROGRAMS: &[&[u8]] = &[
+        b"MZ",
+        b"\x7fELF",
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+    ];
+    let program = PROGRAMS.iter().any(|magic| head.starts_with(magic))
+        || RUNNABLE_EXTENSIONS.contains(&extension);
+    if program {
+        Opening::Reveal
+    } else {
+        Opening::System
+    }
+}
+
+/// Where `path` opens: here when the viewer can show it, otherwise in the
+/// program the system has for it. Reads the start of the file.
+pub fn opening_for(path: &Path) -> Opening {
+    use std::io::Read as _;
+    let mut head = Vec::new();
+    let read = fs::File::open(path).and_then(|file| file.take(8192).read_to_end(&mut head));
+    if read.is_err() {
+        // The viewer says what went wrong.
+        return Opening::Here;
+    }
+    let extension = path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    opening(&extension, &head)
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
@@ -1554,7 +1615,13 @@ impl Render for FileView {
                             .cursor_pointer()
                             .hover(|style| style.text_color(theme::text_muted()))
                             .child(self.display_path.clone())
-                            .on_click(cx.listener(|this, _, _, cx| this.copy_path(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_path(cx)))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|_, event: &MouseDownEvent, _, cx| {
+                                    cx.emit(FileViewEvent::PathMenu(event.position))
+                                }),
+                            ),
                     )
                     .child(div().flex_1())
                     .children(change_bar)
@@ -1592,6 +1659,37 @@ mod tests {
         assert_eq!(prepare_line("\ta\tb"), "    a   b");
         let long = "x".repeat(MAX_LINE_CHARS + 50);
         assert_eq!(prepare_line(&long).chars().count(), MAX_LINE_CHARS + 1);
+    }
+
+    #[test]
+    fn what_the_viewer_cannot_show_opens_elsewhere() {
+        // Text, whatever it is called, and pictures open as a tab.
+        assert_eq!(opening("rs", b"fn main() {}"), Opening::Here);
+        assert_eq!(opening("pdf", b"plain text after all"), Opening::Here);
+        assert_eq!(opening("", b""), Opening::Here);
+        assert_eq!(opening("png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"), Opening::Here);
+        // Anything else with binary content goes to the system's program.
+        assert_eq!(opening("pdf", b"%PDF-1.7\n%\xe2\xe3\0\0"), Opening::System);
+        assert_eq!(opening("zip", b"PK\x03\x04\x14\0\0\0"), Opening::System);
+        assert_eq!(opening("", b"\0\x01\x02"), Opening::System);
+        // A program is pointed at, never run.
+        assert_eq!(opening("", b"\xcf\xfa\xed\xfe\x0c\0\0\x01"), Opening::Reveal);
+        assert_eq!(opening("so", b"\x7fELF\x02\x01\x01\0"), Opening::Reveal);
+        assert_eq!(opening("exe", b"MZ\x90\0\x03\0"), Opening::Reveal);
+        assert_eq!(opening("msi", b"\xd0\xcf\x11\xe0\0\0"), Opening::Reveal);
+        // The same container as an installer, but a document.
+        assert_eq!(opening("doc", b"\xd0\xcf\x11\xe0\0\0"), Opening::System);
+
+        let dir = temp_dir("opening");
+        let pdf = dir.join("report.PDF");
+        fs::write(&pdf, b"%PDF-1.7\n\0\0").unwrap();
+        assert_eq!(opening_for(&pdf), Opening::System);
+        let notes = dir.join("notes.txt");
+        fs::write(&notes, "hello").unwrap();
+        assert_eq!(opening_for(&notes), Opening::Here);
+        assert_eq!(opening_for(&dir.join("missing.bin")), Opening::Here);
+        assert_eq!(opening_for(&dir), Opening::Here);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

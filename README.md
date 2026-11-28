@@ -61,7 +61,10 @@ searchable list.
   `⌘A` selects everything.
 - **Files open where you expect.** A file picked in the sidebar opens as a
   tab in the focused pane. A path `⌘`-clicked in a terminal opens beside that
-  terminal rather than on top of it, with the files already open.
+  terminal rather than on top of it, with the files already open. A file
+  Nexus cannot show (a PDF, an archive, a spreadsheet) opens in the program
+  your computer uses for it instead; a compiled program is shown in the
+  file manager rather than run.
 - **Workspaces that remember.** Each folder you open is a workspace with its
   own window. Nexus saves its panes, splits, tabs, open files, sidebar and the
   chats running in its terminals, and rebuilds them when you come back:
@@ -194,10 +197,12 @@ for Windows. The Windows installer is described in
 | `⌘C` / `⌘A` | `Ctrl+C` / `Ctrl+A` | In a file: copy the selected text / select all of it |
 | `⇧PageUp` / `⇧PageDown` | same | Scroll back through terminal history |
 | `⇧Enter` | same | Insert a newline in an agent prompt |
-| Right-click a terminal | same | Copy the selected text, split up / right / down / left, or close it |
-| Right-click a tab | same | Bookmark or pin the agent chat it runs, close it, or bookmark and close |
+| Right-click a terminal | same | Copy the selected text, split up / right / down / left, or close it; on a file path, show it in Finder (Explorer on Windows) or copy the path |
+| Right-click a tab | same | Bookmark or pin the agent chat it runs, close it, or bookmark and close; for a file's tab, show the file in Finder or copy its path |
+| Right-click a file | same | In the sidebar, in search results or above an open file: show it in Finder (Explorer on Windows) or copy its path |
 | Drag a tab | same | Reorder it, move it to another pane, or drop on a pane's edge to split |
 | Drag a file from the sidebar | same | Type its path into the terminal or chat it is dropped on |
+| Drag the line between Files and Chats | same | Give one list more of the sidebar's height |
 
 On Windows the plain `Ctrl` keys (`Ctrl+C`, `Ctrl+D`, `Ctrl+R`…) go to the
 shell or agent in the terminal, which is why the app's own shortcuts add
@@ -218,8 +223,8 @@ onto a terminal pastes their paths.
 | `file_tree.rs`, `file_view.rs` | File explorer and viewer |
 | `file_search.rs` | Finding files by name and lines by text |
 | `markdown.rs` | Reading Markdown and drawing it as a page |
-| `diff.rs` | Line diff and the git baseline a file is compared against |
 | `selection.rs` | Selecting the text of a file with the mouse: what a press or a drag covers, and painting it |
+| `diff.rs` | Line diff and the git baseline a file is compared against |
 | `layout.rs`, `pane.rs` | The split tree and tabbed panes |
 | `workspace.rs` | A workspace window: title bar, sidebar, actions, saving and restoring its layout |
 | `home.rs`, `windows.rs` | The home view, and opening windows |

@@ -10,8 +10,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
     div, prelude::*, px, uniform_list, App, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    HighlightStyle, ScrollStrategy, SharedString, StyledText, Task, UniformListScrollHandle,
-    Window,
+    HighlightStyle, MouseButton, MouseDownEvent, Pixels, Point, ScrollStrategy, SharedString,
+    StyledText, Task, UniformListScrollHandle, Window,
 };
 
 use crate::assets::icon;
@@ -42,6 +42,11 @@ pub enum FileTreeEvent {
     OpenFile(PathBuf, Option<u32>),
     /// Escape pressed in an empty search box: hand focus back to the panes.
     Dismissed,
+    /// A file or folder was right-clicked.
+    Menu {
+        position: Point<Pixels>,
+        path: PathBuf,
+    },
 }
 
 /// A row of search results.
@@ -598,7 +603,24 @@ impl FileTree {
         if !self.hits[row].opens() {
             return content;
         }
+        let path = match &self.hits[row] {
+            Hit::File { file, .. } => file_of(*file),
+            Hit::Line(hit) => file_of(hit.file),
+            Hit::Heading(_) => None,
+        }
+        .map(|file| file.path.clone());
         content
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |_, event: &MouseDownEvent, _, cx| {
+                    if let Some(path) = path.clone() {
+                        cx.emit(FileTreeEvent::Menu {
+                            position: event.position,
+                            path,
+                        });
+                    }
+                }),
+            )
             .cursor_pointer()
             .when(search_focused && row == self.highlighted, |row| {
                 row.bg(theme::bg_hover())
@@ -715,6 +737,17 @@ impl FileTree {
             .child(glyph)
             .child(div().flex_1().min_w_0().truncate().child(row.name.clone()))
             .on_click(cx.listener(move |this, _, _, cx| this.click_row(index, cx)))
+            .on_mouse_down(MouseButton::Right, {
+                let path = row.path.clone();
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.selected = Some(path.clone());
+                    cx.emit(FileTreeEvent::Menu {
+                        position: event.position,
+                        path: path.clone(),
+                    });
+                    cx.notify();
+                })
+            })
             // Drag onto a terminal to type the path there.
             .on_drag(
                 DraggedPath {

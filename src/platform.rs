@@ -94,6 +94,17 @@ pub fn local_path(url_path: &str, windows: bool) -> PathBuf {
     }
 }
 
+/// What the menus call showing a file in the system's file manager.
+pub fn reveal_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Show in Finder"
+    } else if cfg!(windows) {
+        "Show in Explorer"
+    } else {
+        "Show in Files"
+    }
+}
+
 /// A command for a helper program. On Windows it gets no console window,
 /// which would otherwise flash up each time one runs.
 pub fn command(program: impl AsRef<std::ffi::OsStr>) -> Command {
