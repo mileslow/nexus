@@ -185,7 +185,9 @@ pub fn infer_chat(
 
 impl SessionList {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| TextInput::new(SEARCH_PLACEHOLDER, cx));
+        // A description for the agent can run long, or be pasted in with
+        // its line breaks: the box wraps and grows to show it.
+        let search = cx.new(|cx| TextInput::multiline(SEARCH_PLACEHOLDER, cx));
         cx.subscribe(&search, |this, _, event: &TextInputEvent, cx| match event {
             // A description is for the agent: it filters nothing as it is
             // typed, and what was found stays until the next search.
@@ -871,17 +873,27 @@ impl Render for SessionList {
                     .flex_none()
                     .mx(px(8.))
                     .mt(px(2.))
-                    .h(px(28.))
+                    // One row of text tall, and taller as the text wraps;
+                    // the icon and the toggle stay level with the first row.
+                    .min_h(px(28.))
+                    .py(px(3.))
                     .pl(px(8.))
                     .pr(px(3.))
                     .flex()
-                    .items_center()
+                    .items_start()
                     .gap(px(6.))
                     .rounded(px(6.))
                     .bg(theme::bg_input())
                     .border_1()
                     .border_color(theme::border())
-                    .child(icon("search", px(13.), theme::text_faint()))
+                    .child(
+                        div()
+                            .flex_none()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .child(icon("search", px(13.), theme::text_faint())),
+                    )
                     .child(self.search.clone())
                     .child(self.render_ask_toggle(cx)),
             )

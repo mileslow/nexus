@@ -44,6 +44,11 @@ searchable list.
   and signed in, sends the text of those chats to Codex, and runs read-only
   without leaving a chat of its own behind. Turn off **This folder** to
   search the 300 most recent chats from everywhere; `Esc` stops a search.
+  The search box wraps a long description onto further rows and grows with
+  it, up to six rows, then scrolls. `⇧Return` starts a new line at the same
+  indentation, `Tab` indents, and pasted text keeps its line breaks and
+  indentation; `↑`/`↓` move through the rows before they move through the
+  list.
 - **Search the folder.** The box above the file tree (`⌘⇧F`) finds files by
   name as you type, and under them the lines in any file that contain the
   text, with the match marked. `↑`/`↓` and `Enter` open a file, at the line
