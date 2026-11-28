@@ -1,6 +1,7 @@
-//! Selecting text with the mouse in a view that only shows it. The view
-//! draws its text through a [`Selection`], which remembers where each piece
-//! landed and works out what a press or a drag covers.
+//! Selecting text with the mouse. The view draws its text through a
+//! [`Selection`], which remembers where each piece landed and works out
+//! what a press or a drag covers. A view whose text can be edited also has
+//! it draw the cursor.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -197,7 +198,11 @@ pub struct Selection {
     selected: Option<Range<Place>>,
     /// What the press that began a drag covered. The drag extends it.
     anchor: Option<Range<Place>>,
+    /// The end that moves is the front one: the drag went backwards.
+    reversed: bool,
     dragging: bool,
+    /// Where to draw a text cursor, in a view that has one.
+    cursor: Option<Place>,
     /// The link the press landed on, until the pointer selects something.
     pressed_link: Option<Arc<str>>,
     drawn: Rc<RefCell<Vec<Drawn>>>,
@@ -216,8 +221,32 @@ impl Selection {
     pub fn clear(&mut self) {
         self.selected = None;
         self.anchor = None;
+        self.reversed = false;
         self.dragging = false;
         self.pressed_link = None;
+        self.cursor = None;
+    }
+
+    /// The two ends of the selection, even when they are the same place,
+    /// and whether the one that moves is the first.
+    pub fn ends(&self) -> Option<(Range<Place>, bool)> {
+        Some((self.selected.clone()?, self.reversed))
+    }
+
+    /// Selects `selected`, as a view does whose keys move the selection.
+    /// Shift-clicking then extends it from its still end.
+    pub fn set(&mut self, selected: Range<Place>, reversed: bool) {
+        let still = if reversed { selected.end } else { selected.start };
+        self.anchor = Some(still..still);
+        self.selected = Some(selected);
+        self.reversed = reversed;
+        self.dragging = false;
+        self.pressed_link = None;
+    }
+
+    /// Draws a text cursor at `place`, until the selection is next cleared.
+    pub fn set_cursor(&mut self, place: Option<Place>) {
+        self.cursor = place;
     }
 
     pub fn select_all(&mut self) {
@@ -245,6 +274,10 @@ impl Selection {
     ) -> Selectable {
         Selectable {
             part: self.part(row, piece, &text),
+            cursor: self
+                .cursor
+                .filter(|cursor| (cursor.row, cursor.piece) == (row, piece))
+                .map(|cursor| floor(&text, cursor.offset)),
             styled,
             text,
             row,
@@ -307,8 +340,12 @@ impl Selection {
         self.pressed_link = self.link_at(position);
         self.dragging = true;
         match &self.anchor {
-            Some(anchor) if extend => self.selected = Some(extended(anchor, place)),
+            Some(anchor) if extend => {
+                self.reversed = place < anchor.start;
+                self.selected = Some(extended(anchor, place));
+            }
             _ => {
+                self.reversed = false;
                 self.selected = Some(pressed.clone());
                 self.anchor = Some(pressed);
             }
@@ -329,6 +366,7 @@ impl Selection {
         };
         let selected = Some(extended(anchor, head));
         let changed = selected != self.selected;
+        self.reversed = head < anchor.start;
         self.selected = selected;
         changed
     }
@@ -352,6 +390,8 @@ pub struct Selectable {
     row: usize,
     piece: usize,
     part: Option<Part>,
+    /// The byte a text cursor is drawn before.
+    cursor: Option<usize>,
     links: Links,
     drawn: Rc<RefCell<Vec<Drawn>>>,
 }
@@ -524,6 +564,20 @@ impl Element for Selectable {
         }
         self.styled
             .paint(None, inspector_id, bounds, &mut (), &mut (), window, cx);
+        if let Some(offset) = self.cursor {
+            let line_height = drawn.layout.line_height();
+            // Text with nothing in it has no lines to say where it is.
+            let at = drawn.layout.position_for_index(offset).unwrap_or_else(|| {
+                point(bounds.left(), bounds.center().y - line_height / 2.)
+            });
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(at.x, at.y + px(1.)),
+                    size(px(1.5), line_height - px(2.)),
+                ),
+                theme::accent(),
+            ));
+        }
         self.drawn.borrow_mut().push(drawn);
     }
 }

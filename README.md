@@ -59,6 +59,14 @@ searchable list.
   kept beside the file, and links that open in the browser or as a tab. The
   **Preview** button beside the path switches to the source, with its diff;
   `⌘F` and jumping to a line do the same.
+- **Markdown you can edit.** **Edit** beside the path shows a `.md` file's
+  source at the part you were reading, with a cursor in it; so does clicking
+  in the source. What you type is saved to the file as you go. Return
+  carries on a list, Tab moves lines in and out, and `⌘Z` takes a change
+  back. If an agent rewrites the file while you type, both sets of changes
+  are kept, unless they are to the same words: then the file's stand, and a
+  note says your last edit was dropped. **Preview** shows the page again at
+  the same place.
 - **Text you can copy.** Drag over the text of a file, in the formatted page
   or in the source, to select it. A double-click takes a word, a triple-click
   a line, and `⇧`-click carries the selection to the pointer; dragging past
@@ -200,6 +208,7 @@ for Windows. The Windows installer is described in
 | `⌘`-click | `Ctrl`-click | Open the path or URL under the pointer |
 | `⌘C` / `⌘V` / `⌘K` | `Ctrl+Shift+C` / `Ctrl+Shift+V` / `Ctrl+Shift+K` | Copy selection / paste / clear the terminal |
 | `⌘C` / `⌘A` | `Ctrl+C` / `Ctrl+A` | In a file: copy the selected text / select all of it |
+| `⌘Z` / `⌘⇧Z` / `⌘X` / `⌘V` | `Ctrl+Z` / `Ctrl+Y` / `Ctrl+X` / `Ctrl+V` | In a Markdown file being edited: undo / redo / cut / paste |
 | `⇧PageUp` / `⇧PageDown` | same | Scroll back through terminal history |
 | `⇧Enter` | same | Insert a newline in an agent prompt |
 | Right-click a terminal | same | Copy the selected text, split up / right / down / left, or close it; on a file path, show it in Finder (Explorer on Windows) or copy the path |
@@ -226,6 +235,7 @@ onto a terminal pastes their paths.
 | `session_list.rs` | The searchable chat list |
 | `chat_search.rs` | Finding chats by description with a Codex agent |
 | `file_tree.rs`, `file_view.rs` | File explorer and viewer |
+| `editor.rs` | The text of a Markdown file being edited: the cursor, what each key changes, undo, and merging with changes made on disk |
 | `file_search.rs` | Finding files by name and lines by text |
 | `markdown.rs` | Reading Markdown and drawing it as a page |
 | `selection.rs` | Selecting the text of a file with the mouse: what a press or a drag covers, and painting it |
@@ -264,12 +274,14 @@ cargo test
 Unit tests cover the non-UI logic: path detection, key and mouse encoding,
 session-log parsing, chat filtering, line diffing, the pane layout tree,
 saved-state round trips, theme contrast, find matching, file search, reading
-Markdown, what a text selection covers and copies, reducing chat logs to text
+Markdown, what a text selection covers and copies, editing text and merging
+it with changes made on disk, reducing chat logs to text
 for the agent, version comparison,
 swapping the app during an update, shell arguments and quoting, and the
 hand-over between two copies of the app. They run on macOS and Windows.
 
 ## Not yet
 
-- The file view is read-only and has no text selection.
+- Only Markdown files can be edited; other files are shown read-only. The
+  source does not wrap long lines.
 - No Linux build.

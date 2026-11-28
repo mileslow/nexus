@@ -8,6 +8,7 @@ mod assets;
 mod chat_search;
 mod chrome;
 mod diff;
+mod editor;
 mod file_search;
 mod file_tree;
 mod file_view;

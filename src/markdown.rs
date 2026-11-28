@@ -8,7 +8,7 @@ use gpui::{
     div, font, img, prelude::*, px, relative, AnyElement, Font, FontStyle, FontWeight,
     HighlightStyle, Hsla, SharedString, StrikethroughStyle, StyledText, TextRun, UnderlineStyle,
 };
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, OffsetIter, Options, Parser, Tag, TagEnd};
 
 use crate::assets::icon;
 use crate::selection::{self, Place, Selection};
@@ -20,6 +20,8 @@ pub type CodeColors = Vec<(Range<usize>, Hsla)>;
 #[derive(Debug, Default, PartialEq)]
 pub struct Document {
     pub blocks: Vec<Block>,
+    /// The line of the source that each block begins on, counting from 0.
+    pub lines: Vec<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -210,11 +212,32 @@ impl InlineBuilder {
     }
 }
 
+/// What the Markdown says, piece by piece, remembering where the last
+/// piece began in the source.
+struct Events<'a> {
+    inner: OffsetIter<'a>,
+    at: usize,
+}
+
+impl<'a> Iterator for Events<'a> {
+    type Item = Event<'a>;
+
+    fn next(&mut self) -> Option<Event<'a>> {
+        let (event, range) = self.inner.next()?;
+        self.at = range.start;
+        Some(event)
+    }
+}
+
 struct Reader<'a, 'h> {
-    events: Parser<'a>,
+    events: Events<'a>,
     highlight: &'h dyn Fn(&str, &str) -> CodeColors,
     /// The tick box read most recently, until its list item claims it.
     task: Option<bool>,
+    /// How many blocks deep the reading is.
+    depth: usize,
+    /// Where in the source each block of the page began.
+    starts: Vec<usize>,
 }
 
 /// Reads Markdown. `highlight` colors a code block, given its language.
@@ -224,9 +247,14 @@ pub fn parse(source: &str, highlight: &dyn Fn(&str, &str) -> CodeColors) -> Docu
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
     let mut reader = Reader {
-        events: Parser::new_ext(source, options),
+        events: Events {
+            inner: Parser::new_ext(source, options).into_offset_iter(),
+            at: 0,
+        },
         highlight,
         task: None,
+        depth: 0,
+        starts: Vec::new(),
     };
     let mut blocks = Vec::new();
     // A stray closing tag ends a run of blocks early; keep going past it.
@@ -236,7 +264,20 @@ pub fn parse(source: &str, highlight: &dyn Fn(&str, &str) -> CodeColors) -> Docu
             break;
         }
     }
-    Document { blocks }
+    // The starts come in order, so one pass over the source counts them all.
+    let mut lines = Vec::with_capacity(blocks.len());
+    let (mut line, mut counted) = (0, 0);
+    for start in reader.starts.into_iter().take(blocks.len()) {
+        let start = start.clamp(counted, source.len());
+        line += source.as_bytes()[counted..start]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        counted = start;
+        lines.push(line);
+    }
+    lines.resize(blocks.len(), line);
+    Document { blocks, lines }
 }
 
 impl Reader<'_, '_> {
@@ -247,7 +288,14 @@ impl Reader<'_, '_> {
         let flush = |inline: &mut InlineBuilder, out: &mut Vec<Block>| {
             out.extend(std::mem::take(inline).finish());
         };
+        self.depth += 1;
+        let already = self.starts.len();
         while let Some(event) = self.events.next() {
+            // A block of the page began where the piece that made it did.
+            let began = self.events.at;
+            if self.depth == 1 {
+                self.starts.resize(already + out.len(), began);
+            }
             match event {
                 Event::Start(tag) => match tag {
                     Tag::Emphasis => inline.open(|style| style.italic = true),
@@ -291,8 +339,16 @@ impl Reader<'_, '_> {
                 }
                 Event::TaskListMarker(checked) => self.task = Some(checked),
             }
+            if self.depth == 1 {
+                self.starts.resize(already + out.len(), began);
+            }
         }
         flush(&mut inline, &mut out);
+        if self.depth == 1 {
+            let at = self.events.at;
+            self.starts.resize(already + out.len(), at);
+        }
+        self.depth -= 1;
         out
     }
 
@@ -564,6 +620,21 @@ fn pieces<'a>(blocks: &'a [Block], gap: &'static str, depth: usize, out: &mut Ve
 }
 
 impl Document {
+    /// The lines of the source that block `block` is made from, up to the
+    /// start of the next block; `count` is how many lines the source has.
+    pub fn lines_of_block(&self, block: usize, count: usize) -> Range<usize> {
+        let start = self.lines.get(block).copied().unwrap_or(count).min(count);
+        let end = self.lines.get(block + 1).copied().unwrap_or(count);
+        start..end.clamp(start, count.max(start))
+    }
+
+    /// The block that line `line` of the source is in, or follows.
+    pub fn block_at_line(&self, line: usize) -> usize {
+        self.lines
+            .partition_point(|start| *start <= line)
+            .saturating_sub(1)
+    }
+
     /// The text a selection covers, as it would be typed out plainly.
     pub fn text_between(&self, selected: &Range<Place>) -> String {
         let mut out = String::new();
@@ -1232,6 +1303,24 @@ mod tests {
         // Ending at the very start of a block takes nothing from it.
         assert_eq!(copy(place(0, 0, 0), place(1, 0, 0)), "Title");
         assert_eq!(copy(place(9, 0, 0), Place::END), "");
+    }
+
+    #[test]
+    fn each_block_knows_the_line_it_began_on() {
+        let source = "---\ntitle: x\n---\n# Title\n\nA paragraph\nof two lines.\n\n- one\n- two\n\n\n```sh\nls\n```\n\n<img src=\"a.png\">\n\nLast.\n";
+        let document = parse(source, &|_, _| Vec::new());
+        assert_eq!(document.blocks.len(), document.lines.len());
+        assert_eq!(document.lines, [3, 5, 8, 12, 16, 18]);
+        // A line inside a block, or in the gap after it, belongs to it.
+        assert_eq!(document.block_at_line(0), 0);
+        assert_eq!(document.block_at_line(6), 1);
+        assert_eq!(document.block_at_line(11), 2);
+        assert_eq!(document.block_at_line(13), 3);
+        assert_eq!(document.block_at_line(99), 5);
+        assert_eq!(parse("", &|_, _| Vec::new()).block_at_line(4), 0);
+        assert_eq!(document.lines_of_block(1, 19), 5..8);
+        assert_eq!(document.lines_of_block(5, 19), 18..19);
+        assert_eq!(document.lines_of_block(9, 19), 19..19);
     }
 
     #[test]

@@ -1,23 +1,25 @@
-//! A read-only file viewer: virtualized lines, background syntax
-//! highlighting, jump-to-line, automatic reload when the file changes, and an
-//! inline diff of what changed since the last commit.
+//! A file viewer: virtualized lines, background syntax highlighting,
+//! jump-to-line, automatic reload when the file changes, and an inline diff
+//! of what changed since the last commit. A Markdown file can also be
+//! edited in place; what is typed is written to the file as it is typed.
 
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
 use gpui::{
-    actions, canvas, combine_highlights, div, img, list, point, prelude::*, px, uniform_list,
-    AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase, Entity, EventEmitter,
-    FocusHandle, Focusable, HighlightStyle, Hsla, KeyBinding, ListAlignment,
-    ListHorizontalSizingBehavior, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, Pixels, Rgba, ScrollStrategy, SharedString, StyledText, Task,
-    UniformListScrollHandle, Window,
+    actions, canvas, combine_highlights, div, img, list, point, prelude::*, px, size,
+    uniform_list, AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    HighlightStyle, Hsla, KeyBinding, KeyDownEvent, ListAlignment,
+    ListHorizontalSizingBehavior, ListOffset, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, Rgba, ScrollStrategy, SharedString,
+    StyledText, Task, UTF16Selection, UnderlineStyle, UniformListScrollHandle, Window,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
@@ -25,22 +27,31 @@ use syntect::parsing::SyntaxSet;
 
 use crate::assets::icon;
 use crate::diff::{self, Baseline, Diff, RowKind};
+use crate::editor::{self, Buffer, Edited, Motion, Reach};
 use crate::find::{self, FindBar, FindEvent};
 use crate::markdown::{self, Target};
 use crate::platform::keys;
-use crate::selection::{self, Selection};
+use crate::selection::{self, Place, Selection};
 use crate::terminal;
 use crate::theme;
 
-actions!(file_view, [SelectAll]);
+actions!(file_view, [SelectAll, Cut, Undo, Redo, Save]);
 
 pub fn bind_keys(cx: &mut App) {
     let ctx = Some("FileView");
     cx.bind_keys([
-        // The same Copy the Edit menu offers.
+        // The same Copy and Paste the Edit menu offers.
         KeyBinding::new(keys("cmd-c", "ctrl-c"), terminal::Copy, ctx),
+        KeyBinding::new(keys("cmd-v", "ctrl-v"), terminal::Paste, ctx),
         KeyBinding::new(keys("cmd-a", "ctrl-a"), SelectAll, ctx),
+        KeyBinding::new(keys("cmd-x", "ctrl-x"), Cut, ctx),
+        KeyBinding::new(keys("cmd-z", "ctrl-z"), Undo, ctx),
+        KeyBinding::new(keys("cmd-shift-z", "ctrl-shift-z"), Redo, ctx),
+        KeyBinding::new(keys("cmd-s", "ctrl-s"), Save, ctx),
     ]);
+    if !cfg!(target_os = "macos") {
+        cx.bind_keys([KeyBinding::new("ctrl-y", Redo, ctx)]);
+    }
 }
 
 const MAX_FILE_BYTES: u64 = 24 * 1024 * 1024;
@@ -55,6 +66,14 @@ const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown", "mdown", "mkd", "mdx"];
 const MAX_PREVIEW_BYTES: u64 = 1024 * 1024;
 /// Code blocks longer than this are left uncolored.
 const MAX_CODE_BLOCK_BYTES: usize = 256 * 1024;
+/// A Markdown file no bigger than this can be edited here.
+const MAX_EDIT_BYTES: usize = 1024 * 1024;
+/// And with no line longer: the editor draws each line whole.
+const MAX_EDIT_LINE: usize = 20_000;
+/// How long after the last key what was typed is written to the file.
+const SAVE_DELAY: Duration = Duration::from_millis(400);
+/// Shown when the file and the typing changed the same words at once.
+const EDIT_LOST: &str = "The file changed as you typed; your last edit was dropped";
 
 pub enum FileViewEvent {
     /// A link in the file points at this file or folder.
@@ -79,6 +98,9 @@ struct TextContent {
     highlights: Vec<Option<LineHighlights>>,
     longest: usize,
     changes: Option<Changes>,
+    /// The text the file is compared against, to compare it again when it
+    /// is edited.
+    base: Option<Lines>,
     /// What the file is compared against, shown beside the path.
     baseline_note: Option<&'static str>,
 }
@@ -94,6 +116,8 @@ enum Loaded {
     Text {
         lines: Vec<SharedString>,
         longest: usize,
+        /// The file's own text, when it can be edited here.
+        raw: Option<String>,
     },
     Image,
     Message(SharedString),
@@ -104,6 +128,7 @@ struct Snapshot {
     loaded: Loaded,
     mtime: Option<SystemTime>,
     changes: Option<Changes>,
+    base: Option<Lines>,
     baseline_note: Option<&'static str>,
     in_repository: bool,
     git_watch: Option<PathBuf>,
@@ -151,9 +176,31 @@ pub struct FileView {
     /// The text selected with the mouse, in whichever of the page and the
     /// source is showing.
     selection: Selection,
+    /// The file's own text, when it can be edited here.
+    buffer: Option<Buffer>,
+    /// That text as it was last read from the file or written to it.
+    saved: String,
+    /// The file's modification time and size at that moment.
+    stamp: Option<(SystemTime, u64)>,
+    /// What was typed has yet to be written to the file.
+    unsaved: bool,
+    /// Why the file could not be written, or what became of an edit.
+    save_note: Option<SharedString>,
+    /// The text has a cursor in it: it was clicked in, or Edit was.
+    cursor: bool,
+    /// Bring the cursor into view when the text is next drawn.
+    reveal_cursor: bool,
+    /// The formatted page was read before the last edit.
+    page_stale: bool,
+    /// The line of the source to show the page at, once it has been read.
+    page_line: Option<usize>,
+    /// Where to scroll the page once the block there has been measured:
+    /// the block, how far through it, and how many frames are left to try.
+    page_place: Option<(usize, f32, u8)>,
     _load: Option<Task<()>>,
     _highlight: Option<Task<()>>,
     _markdown: Option<Task<()>>,
+    _save: Option<Task<()>>,
 }
 
 impl EventEmitter<FileViewEvent> for FileView {}
@@ -167,6 +214,8 @@ impl Focusable for FileView {
 impl Drop for FileView {
     fn drop(&mut self) {
         self.cancel_highlight.store(true, Ordering::Relaxed);
+        // A tab closed within a moment of typing still keeps what was typed.
+        self.flush();
     }
 }
 
@@ -386,9 +435,51 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
-/// Splits file bytes into display lines and finds the longest. `None` for
-/// binary data.
-fn text_lines(bytes: &[u8]) -> Option<(Vec<SharedString>, usize)> {
+/// When a file was last written and how big it is: enough to tell that
+/// something else has written to it since.
+fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// The text of a file that can be edited here: Markdown the user may write
+/// to, in UTF-8, and small enough to work on whole.
+fn editable_text(path: &Path, meta: &fs::Metadata, bytes: &[u8]) -> Option<String> {
+    if !is_markdown(path) || meta.permissions().readonly() || bytes.len() > MAX_EDIT_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    text.split('\n')
+        .all(|line| line.len() <= MAX_EDIT_LINE)
+        .then(|| text.to_string())
+}
+
+/// The longest of `lines`.
+fn longest_of(lines: &[SharedString]) -> usize {
+    let mut longest = 0;
+    for (index, line) in lines.iter().enumerate() {
+        if line.len() > lines[longest].len() {
+            longest = index;
+        }
+    }
+    longest
+}
+
+/// Colors worked out for a line, made to fit the line as it is now.
+fn fit_spans(spans: &[(Range<usize>, Hsla)], line: &str) -> LineHighlights {
+    spans
+        .iter()
+        .filter_map(|(range, color)| {
+            let range = range.start.min(line.len())..range.end.min(line.len());
+            let whole = line.is_char_boundary(range.start) && line.is_char_boundary(range.end);
+            (whole && !range.is_empty()).then_some((range, *color))
+        })
+        .collect()
+}
+
+/// Splits file bytes into display lines, each cut off after `limit`
+/// characters, and finds the longest. `None` for binary data.
+fn text_lines(bytes: &[u8], limit: usize) -> Option<(Vec<SharedString>, usize)> {
     if bytes.iter().take(8192).any(|&byte| byte == 0) {
         return None;
     }
@@ -397,7 +488,7 @@ fn text_lines(bytes: &[u8]) -> Option<(Vec<SharedString>, usize)> {
     let mut longest_len = 0;
     let mut lines: Vec<SharedString> = Vec::new();
     for (index, raw) in text.split('\n').enumerate() {
-        let line = prepare_line(raw.strip_suffix('\r').unwrap_or(raw));
+        let line = shown_line(raw.strip_suffix('\r').unwrap_or(raw), limit);
         if line.len() > longest_len {
             longest_len = line.len();
             longest = index;
@@ -449,8 +540,22 @@ fn load(path: &Path) -> (Loaded, Option<SystemTime>) {
             )
         }
     };
-    match text_lines(&bytes) {
-        Some((lines, longest)) => (Loaded::Text { lines, longest }, mtime),
+    // A file being edited is drawn as it is, however long its lines.
+    let raw = editable_text(path, &meta, &bytes);
+    let limit = if raw.is_some() {
+        usize::MAX
+    } else {
+        MAX_LINE_CHARS
+    };
+    match text_lines(&bytes, limit) {
+        Some((lines, longest)) => (
+            Loaded::Text {
+                lines,
+                longest,
+                raw,
+            },
+            mtime,
+        ),
         None => (Loaded::Message("Binary file — no preview.".into()), mtime),
     }
 }
@@ -484,13 +589,25 @@ fn snapshot(path: &Path, opened: Option<Lines>) -> Snapshot {
         loaded,
         mtime,
         changes: None,
+        base: None,
         baseline_note: None,
         in_repository: false,
         git_watch: None,
         git_stamp: None,
     };
-    let Loaded::Text { lines, longest } = &snapshot.loaded else {
+    let Loaded::Text {
+        lines,
+        longest,
+        raw,
+    } = &snapshot.loaded
+    else {
         return snapshot;
+    };
+    // Compared line for line, so both are cut off at the same length.
+    let limit = if raw.is_some() {
+        usize::MAX
+    } else {
+        MAX_LINE_CHARS
     };
 
     let git = diff::git_state(path);
@@ -501,7 +618,7 @@ fn snapshot(path: &Path, opened: Option<Lines>) -> Snapshot {
         Baseline::Head(bytes) => {
             snapshot.baseline_note = Some("vs last commit");
             (bytes.len() as u64 <= MAX_FILE_BYTES)
-                .then(|| text_lines(&bytes))
+                .then(|| text_lines(&bytes, limit))
                 .flatten()
                 .map(|(base, _)| Arc::new(base))
         }
@@ -516,16 +633,26 @@ fn snapshot(path: &Path, opened: Option<Lines>) -> Snapshot {
             opened
         }
     };
-    snapshot.changes = base.and_then(|base| changes_against(base, lines, *longest));
+    snapshot.changes = base
+        .clone()
+        .and_then(|base| changes_against(base, lines, *longest));
+    snapshot.base = base;
     snapshot
 }
 
 /// Expands tabs and bounds pathological line lengths (minified bundles).
+#[cfg(test)]
 fn prepare_line(raw: &str) -> String {
+    shown_line(raw, MAX_LINE_CHARS)
+}
+
+/// A line as it is drawn: tabs spread out to their stops, and nothing past
+/// `limit` characters.
+fn shown_line(raw: &str, limit: usize) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut column = 0;
     for c in raw.chars() {
-        if column >= MAX_LINE_CHARS {
+        if column >= limit {
             out.push('…');
             break;
         }
@@ -643,6 +770,17 @@ impl FileView {
             markdown: None,
             page: ListState::new(0, ListAlignment::Top, px(600.)),
             selection: Selection::default(),
+            buffer: None,
+            saved: String::new(),
+            stamp: None,
+            unsaved: false,
+            save_note: None,
+            cursor: false,
+            reveal_cursor: false,
+            page_stale: false,
+            page_line: None,
+            page_place: None,
+            _save: None,
             _markdown: None,
             path,
             display_path: display_path.into(),
@@ -671,6 +809,12 @@ impl FileView {
         };
         this.go_to_line(line, cx);
         this.reload(cx);
+        // Quitting within a moment of typing still keeps what was typed.
+        cx.on_app_quit(|this, _| {
+            this.flush();
+            async {}
+        })
+        .detach();
         this
     }
 
@@ -918,11 +1062,17 @@ impl FileView {
             return;
         }
         let path = self.path.clone();
+        // What is being edited is the newest there is of the file.
+        let edited = self.buffer.as_ref().map(|buffer| buffer.text().to_string());
+        self.page_stale = false;
         self._markdown = Some(cx.spawn(async move |this, cx| {
             let document = cx
                 .background_spawn(async move {
-                    let bytes = fs::read(&path).unwrap_or_default();
-                    markdown::parse(&String::from_utf8_lossy(&bytes), &highlight_code)
+                    let source = edited.unwrap_or_else(|| {
+                        let bytes = fs::read(&path).unwrap_or_default();
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    });
+                    markdown::parse(&source, &highlight_code)
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -931,6 +1081,9 @@ impl FileView {
                 this.page.reset(document.blocks.len());
                 this.page.scroll_to(top);
                 this.markdown = Some(document);
+                if let Some(line) = this.page_line.take() {
+                    this.show_page_at(line);
+                }
                 if this.preview {
                     this.selection.clear();
                 }
@@ -957,8 +1110,118 @@ impl FileView {
     }
 
     /// Switches a Markdown file between the formatted page and its source.
-    fn toggle_preview(&mut self, cx: &mut Context<Self>) {
-        self.set_preview(!self.preview);
+    fn toggle_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preview {
+            self.show_source(window, cx);
+        } else {
+            self.show_page(cx);
+        }
+    }
+
+    /// The line of the file at the top of the source as it is scrolled.
+    fn top_line(&self) -> usize {
+        let top = self.top_row();
+        match self.shown_changes() {
+            Some(changes) => changes.diff.line_of_row(top),
+            None => top,
+        }
+    }
+
+    /// Shows the formatted page, at the part of the file the source showed.
+    fn show_page(&mut self, cx: &mut Context<Self>) {
+        if self.preview || !matches!(self.content, Content::Text(_)) {
+            self.set_preview(true);
+            cx.notify();
+            return;
+        }
+        let line = self.top_line();
+        self.set_preview(true);
+        self.save(cx);
+        if self.page_stale || self.markdown.is_none() {
+            self.page_line = Some(line);
+            self.read_markdown(cx);
+        } else {
+            self.show_page_at(line);
+        }
+        cx.notify();
+    }
+
+    /// How many lines the source has.
+    fn line_count(&self) -> usize {
+        match &self.content {
+            Content::Text(text) => text.lines.len(),
+            _ => 0,
+        }
+    }
+
+    /// Scrolls the page to the block that holds `line` of the source, and
+    /// as far through the block as the line is.
+    fn show_page_at(&mut self, line: usize) {
+        let Some(document) = &self.markdown else {
+            return;
+        };
+        let block = document.block_at_line(line);
+        let lines = document.lines_of_block(block, self.line_count());
+        let through = line.saturating_sub(lines.start) as f32 / lines.len().max(1) as f32;
+        self.page.scroll_to(ListOffset {
+            item_ix: block,
+            offset_in_item: px(0.),
+        });
+        // How tall the block is will be known once it has been drawn.
+        self.page_place = Some((block, through.clamp(0., 1.), 3));
+    }
+
+    /// Finishes [`FileView::show_page_at`] when the block has been measured.
+    fn place_page(&mut self, cx: &mut Context<Self>) {
+        let Some((block, through, tries)) = self.page_place.take() else {
+            return;
+        };
+        match self.page.bounds_for_item(block) {
+            Some(bounds) => self.page.scroll_to(ListOffset {
+                item_ix: block,
+                offset_in_item: bounds.size.height * through,
+            }),
+            None if tries > 0 => {
+                self.page_place = Some((block, through, tries - 1));
+                cx.notify();
+            }
+            None => {}
+        }
+    }
+
+    /// The line of the source that the top of the page shows.
+    fn page_top_line(&self) -> Option<usize> {
+        let document = self.markdown.as_ref().filter(|_| self.previewing())?;
+        let top = self.page.logical_scroll_top();
+        let lines = document.lines_of_block(top.item_ix, self.line_count());
+        let through = match self.page.bounds_for_item(top.item_ix) {
+            Some(bounds) if bounds.size.height > px(0.) => {
+                (top.offset_in_item / bounds.size.height).clamp(0., 1.)
+            }
+            _ => 0.,
+        };
+        let line = lines.start + (lines.len() as f32 * through) as usize;
+        Some(line.min(lines.end.saturating_sub(1).max(lines.start)))
+    }
+
+    /// Shows the source, at the part of the file the page showed, with a
+    /// cursor in it when it can be edited.
+    fn show_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let line = self.page_top_line();
+        self.page_place = None;
+        self.set_preview(false);
+        if let Some(line) = line {
+            self.scroll
+                .scroll_to_item_strict(self.row_for_line(line), ScrollStrategy::Top);
+        }
+        if let Some(buffer) = self.buffer.as_mut() {
+            if !self.cursor {
+                let at = buffer.line_start(line.unwrap_or(0));
+                buffer.select(at, at);
+                self.cursor = true;
+            }
+            window.focus(&self.focus_handle);
+        }
         cx.notify();
     }
 
@@ -973,6 +1236,7 @@ impl FileView {
         window.focus(&self.focus_handle);
         self.selection
             .press(event.position, event.click_count, event.modifiers.shift);
+        self.take_selection();
         cx.notify();
     }
 
@@ -985,6 +1249,7 @@ impl FileView {
         if event.pressed_button != Some(MouseButton::Left) {
             // The button was let go where the window did not hear of it.
             self.selection.release(event.position);
+            cx.notify();
             return;
         }
         // Dragging past the top or bottom scrolls on to more of the text.
@@ -1001,6 +1266,7 @@ impl FileView {
             }
         }
         if self.selection.drag(event.position) || past != px(0.) {
+            self.take_selection();
             cx.notify();
         }
     }
@@ -1031,6 +1297,10 @@ impl FileView {
 
     /// The text selected with the mouse, if any.
     fn selected_text(&self) -> Option<String> {
+        if let (true, Some(buffer)) = (self.editing(), &self.buffer) {
+            // The file's own text, tabs and all.
+            return Some(buffer.text()[buffer.selection()].to_string());
+        }
         let selected = self.selection.range()?;
         let Content::Text(text) = &self.content else {
             return None;
@@ -1065,9 +1335,469 @@ impl FileView {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.content, Content::Text(_)) {
-            self.selection.select_all();
+        if !matches!(self.content, Content::Text(_)) {
+            return;
+        }
+        match self.buffer.as_mut().filter(|_| !self.preview) {
+            Some(buffer) => {
+                buffer.select_all();
+                self.cursor = true;
+            }
+            None => self.selection.select_all(),
+        }
+        cx.notify();
+    }
+
+    // ---- editing --------------------------------------------------------------
+
+    /// Whether the source is showing and can be edited.
+    fn editable(&self) -> bool {
+        self.buffer.is_some() && !self.preview && matches!(self.content, Content::Text(_))
+    }
+
+    /// Whether keys go to the text: it can be edited and has a cursor in it.
+    fn editing(&self) -> bool {
+        self.cursor && self.editable()
+    }
+
+    /// Where a byte of the file's text is drawn.
+    fn place_of(&self, offset: usize) -> Option<Place> {
+        let buffer = self.buffer.as_ref()?;
+        let line = buffer.line_of(offset);
+        Some(Place {
+            row: self.row_for_line(line),
+            piece: 0,
+            offset: editor::to_shown(buffer.line(line), offset - buffer.line_start(line)),
+        })
+    }
+
+    /// The byte of the file's text drawn at `place`. A place among lines
+    /// that were removed from the file is the start of the next line in it.
+    fn offset_at(&self, place: Place) -> Option<usize> {
+        let buffer = self.buffer.as_ref()?;
+        let (line, shown) = match self.shown_changes() {
+            Some(changes) => match changes.diff.rows.get(place.row) {
+                Some(row) if row.kind != RowKind::Removed => (row.index as usize, place.offset),
+                Some(_) => (changes.diff.line_of_row(place.row), 0),
+                None => (usize::MAX, usize::MAX),
+            },
+            None => (place.row, place.offset),
+        };
+        if line >= buffer.line_count() {
+            return Some(buffer.end());
+        }
+        Some(buffer.line_start(line) + editor::from_shown(buffer.line(line), shown))
+    }
+
+    /// Makes what the mouse selected the selection that keys work on.
+    fn take_selection(&mut self) {
+        if !self.editable() {
+            return;
+        }
+        let Some((ends, reversed)) = self.selection.ends() else {
+            return;
+        };
+        let (Some(start), Some(end)) = (self.offset_at(ends.start), self.offset_at(ends.end))
+        else {
+            return;
+        };
+        if let Some(buffer) = self.buffer.as_mut() {
+            if reversed {
+                buffer.select(end, start);
+            } else {
+                buffer.select(start, end);
+            }
+            self.cursor = true;
+        }
+    }
+
+    /// Has the text drawn with the selection that keys work on, and with
+    /// its cursor while the view has the keyboard.
+    fn show_selection(&mut self, focused: bool) {
+        if !self.editing() {
+            return;
+        }
+        let Some(buffer) = self.buffer.as_ref() else {
+            return;
+        };
+        let selected = buffer.selection();
+        let (Some(start), Some(end), Some(head)) = (
+            self.place_of(selected.start),
+            self.place_of(selected.end),
+            self.place_of(buffer.head()),
+        ) else {
+            return;
+        };
+        // A drag in progress knows better what it began with.
+        if !self.selection.is_dragging() {
+            self.selection.set(start..end, buffer.reversed());
+        }
+        self.selection.set_cursor(focused.then_some(head));
+    }
+
+    /// The row the cursor is on, and how many columns along it.
+    fn cursor_cell(&self) -> Option<(usize, usize)> {
+        let buffer = self.buffer.as_ref()?;
+        let line = buffer.line_of(buffer.head());
+        let column = editor::column_of(buffer.line(line), buffer.head() - buffer.line_start(line));
+        Some((self.row_for_line(line), column))
+    }
+
+    /// How many rows of the source fit in the view.
+    fn rows_in_view(&self) -> usize {
+        let height = self.scroll.0.borrow().base_handle.bounds().size.height;
+        ((f32::from(height) / LINE_HEIGHT).floor() as usize).max(1)
+    }
+
+    /// Scrolls no further than it takes to have the cursor on screen.
+    fn scroll_to_cursor(&mut self) {
+        let Some((row, column)) = self.cursor_cell() else {
+            return;
+        };
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let viewport = handle.bounds().size;
+        if viewport.height <= px(0.) {
+            return;
+        }
+        let offset = handle.offset();
+        let top = px(row as f32 * LINE_HEIGHT);
+        let mut y = -offset.y;
+        if top < y {
+            y = top;
+        } else if top + px(LINE_HEIGHT) > y + viewport.height {
+            y = top + px(LINE_HEIGHT) - viewport.height;
+        }
+        // The font is monospaced, so columns are a matter of counting.
+        let across = self.gutter_width + self.char_width * column as f32;
+        let margin = self.char_width * 4.;
+        let mut x = -offset.x;
+        if column == 0 {
+            x = px(0.);
+        } else if across + margin > x + viewport.width {
+            x = across + margin - viewport.width;
+        } else if across - margin < x + self.gutter_width {
+            x = (across - margin - self.gutter_width).max(px(0.));
+        }
+        handle.set_offset(point(-x.max(px(0.)), -y.max(px(0.))));
+    }
+
+    /// Where on screen the cursor is, for an input method to open beside.
+    fn cursor_bounds(&self) -> Option<Bounds<Pixels>> {
+        let (row, column) = self.cursor_cell()?;
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let (list, offset) = (handle.bounds(), handle.offset());
+        Some(Bounds::new(
+            point(
+                list.left() + offset.x + self.gutter_width + self.char_width * column as f32,
+                list.top() + offset.y + px(row as f32 * LINE_HEIGHT),
+            ),
+            size(px(1.5), px(LINE_HEIGHT)),
+        ))
+    }
+
+    /// Draws again the lines an edit touched, and sees that it is saved.
+    fn edited(&mut self, edited: Edited, cx: &mut Context<Self>) {
+        let (Some(buffer), Content::Text(text)) = (&self.buffer, &mut self.content) else {
+            return;
+        };
+        let shown = |line: usize| SharedString::from(shown_line(buffer.line(line), usize::MAX));
+        let lines = Arc::make_mut(&mut text.lines);
+        let old = edited.first.min(lines.len())..(edited.first + edited.old).min(lines.len());
+        // The colors of a line being typed in stay, near enough, until it
+        // is colored again; without them it would flash at every key.
+        let kept = (edited.old == 1 && edited.new == 1)
+            .then(|| text.highlights.get(edited.first).cloned().flatten())
+            .flatten();
+        lines.splice(old.clone(), (edited.first..edited.first + edited.new).map(shown));
+        text.highlights
+            .splice(old, std::iter::repeat_n(None, edited.new));
+        if lines.len() != buffer.line_count() {
+            *lines = (0..buffer.line_count()).map(shown).collect();
+            text.highlights = vec![None; lines.len()];
+        } else if let (Some(kept), Some(line)) = (kept, lines.get(edited.first)) {
+            text.highlights[edited.first] = Some(fit_spans(&kept, line));
+        }
+        text.longest = longest_of(lines);
+        text.changes = text
+            .base
+            .clone()
+            .and_then(|base| changes_against(base, lines, text.longest));
+        let lines = text.lines.clone();
+        self.start_highlighting(lines, cx);
+        self.text_changed(cx);
+    }
+
+    /// Draws the whole of the text being edited again, after something
+    /// other than a key changed it.
+    fn redraw_text(&mut self, cx: &mut Context<Self>) {
+        let (Some(buffer), Content::Text(text)) = (&self.buffer, &mut self.content) else {
+            return;
+        };
+        let Some((lines, longest)) = text_lines(buffer.text().as_bytes(), usize::MAX) else {
+            return;
+        };
+        text.highlights = vec![None; lines.len()];
+        text.lines = Arc::new(lines);
+        text.longest = longest;
+        text.changes = text
+            .base
+            .clone()
+            .and_then(|base| changes_against(base, &text.lines, longest));
+        let lines = text.lines.clone();
+        self.start_highlighting(lines, cx);
+        self.highlighted_line = None;
+        self.hunk_cursor = None;
+        self.page_stale = true;
+        if self.find_open {
+            self.refresh_find(false, cx);
+        }
+        cx.notify();
+    }
+
+    /// What follows any edit: the marks that pointed at lines no longer
+    /// do, and the file is written once the typing pauses.
+    fn text_changed(&mut self, cx: &mut Context<Self>) {
+        self.highlighted_line = None;
+        self.hunk_cursor = None;
+        self.page_stale = true;
+        self.unsaved = true;
+        self.save_note = None;
+        self.reveal_cursor = true;
+        if self.find_open {
+            self.refresh_find(false, cx);
+        }
+        self.save_later(cx);
+        cx.notify();
+    }
+
+    /// Writes the file once the typing has paused.
+    fn save_later(&mut self, cx: &mut Context<Self>) {
+        self._save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVE_DELAY).await;
+            let _ = this.update(cx, |this, cx| this.save(cx));
+        }));
+    }
+
+    /// The text an input method is composing: its line, and where in the
+    /// line as drawn.
+    fn composing(&self) -> Option<(usize, Range<usize>)> {
+        let buffer = self.buffer.as_ref().filter(|_| self.editing())?;
+        let marked = buffer.marked()?;
+        let line = buffer.line_of(marked.start);
+        let (start, text) = (buffer.line_start(line), buffer.line(line));
+        let shown = |offset: usize| editor::to_shown(text, offset.saturating_sub(start).min(text.len()));
+        Some((line, shown(marked.start)..shown(marked.end)))
+    }
+
+    /// Takes in the file's text as it now is on disk. What was typed and
+    /// not yet written is kept wherever the two did not change the same
+    /// words.
+    fn absorb(&mut self, theirs: String) {
+        match &mut self.buffer {
+            Some(buffer) if self.unsaved && theirs != self.saved => {
+                match editor::merge(&self.saved, buffer.text(), &theirs) {
+                    Some(merged) => buffer.set_text(merged),
+                    None => {
+                        buffer.set_text(theirs.clone());
+                        self.save_note = Some(EDIT_LOST.into());
+                    }
+                }
+            }
+            Some(buffer) if !self.unsaved && buffer.text() != theirs => {
+                buffer.set_text(theirs.clone())
+            }
+            Some(_) => {}
+            None => self.buffer = Some(Buffer::new(theirs.clone())),
+        }
+        self.unsaved = self
+            .buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.text() != theirs);
+        self.saved = theirs;
+    }
+
+    /// Writes what was typed to the file. Returns whether the text being
+    /// edited took in changes that something else had made to the file.
+    fn flush(&mut self) -> bool {
+        if !self.unsaved || self.buffer.is_none() {
+            return false;
+        }
+        let mut absorbed = false;
+        if file_stamp(&self.path) != self.stamp {
+            // Something else wrote to the file since it was last read.
+            match fs::read(&self.path).map(String::from_utf8) {
+                Ok(Ok(theirs)) if theirs != self.saved => {
+                    self.absorb(theirs);
+                    absorbed = true;
+                }
+                Ok(Ok(_)) => {}
+                // No longer text, or no longer there: not for typing over.
+                Ok(Err(_)) => {
+                    self.unsaved = false;
+                    return false;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.unsaved = false;
+                    return false;
+                }
+                Err(_) => {}
+            }
+        }
+        let Some(buffer) = self.buffer.as_ref() else {
+            return absorbed;
+        };
+        if self.unsaved {
+            match fs::write(&self.path, buffer.text()) {
+                Ok(()) => {
+                    self.saved = buffer.text().to_string();
+                    self.unsaved = false;
+                    // Word of a dropped edit stays until the next one.
+                    if self.save_note.as_ref().is_some_and(|note| note != EDIT_LOST) {
+                        self.save_note = None;
+                    }
+                }
+                Err(error) => {
+                    self.save_note = Some(format!("Not saved: {error}").into());
+                    return absorbed;
+                }
+            }
+        }
+        // The file as it now is holds nothing new to this view.
+        self.stamp = file_stamp(&self.path);
+        self.mtime = self.stamp.map(|(mtime, _)| mtime);
+        absorbed
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>) {
+        if self.flush() {
+            self.redraw_text(cx);
+        }
+        cx.notify();
+    }
+
+    fn save_now(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
+        self.save(cx);
+    }
+
+    /// Whether a key pressed now is meant for the text: it is being
+    /// edited, and the keyboard is in it rather than in the find bar.
+    fn typing(&self, window: &Window) -> bool {
+        self.editing() && self.focus_handle.is_focused(window)
+    }
+
+    fn paste(&mut self, _: &terminal::Paste, window: &mut Window, cx: &mut Context<Self>) {
+        let text = cx.read_from_clipboard().and_then(|item| item.text());
+        let (true, Some(buffer), Some(text)) = (self.typing(window), self.buffer.as_mut(), text)
+        else {
+            return;
+        };
+        let edited = buffer.paste(&text.replace('\0', ""));
+        self.edited(edited, cx);
+    }
+
+    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        let (true, Some(buffer)) = (self.typing(window), self.buffer.as_mut()) else {
+            return;
+        };
+        let selected = buffer.selection();
+        if selected.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            buffer.text()[selected].to_string(),
+        ));
+        if let Some(edited) = buffer.erase(Reach::Character, false) {
+            self.edited(edited, cx);
+        }
+    }
+
+    fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        let (true, Some(buffer)) = (self.typing(window), self.buffer.as_mut()) else {
+            return;
+        };
+        if let Some(edited) = buffer.undo() {
+            self.edited(edited, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        let (true, Some(buffer)) = (self.typing(window), self.buffer.as_mut()) else {
+            return;
+        };
+        if let Some(edited) = buffer.redo() {
+            self.edited(edited, cx);
+        }
+    }
+
+    /// The keys that move the cursor and the ones that take text away.
+    /// Keys that type go to the view as an input, below.
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.typing(window) {
+            return;
+        }
+        let page = self.rows_in_view().saturating_sub(1).max(1) as isize;
+        let Some(buffer) = self.buffer.as_mut() else {
+            return;
+        };
+        // An input method that is composing gets the keys first.
+        if buffer.marked().is_some() {
+            return;
+        }
+        let held = event.keystroke.modifiers;
+        let mac = cfg!(target_os = "macos");
+        // The key that goes by words, and the one that goes all the way.
+        let (word, far) = if mac {
+            (held.alt, held.platform)
+        } else {
+            (held.control, false)
+        };
+        if (mac && held.control) || (!mac && (held.alt || held.platform)) {
+            return;
+        }
+        let key = event.keystroke.key.as_str();
+        let motion = match key {
+            "left" if far => Some(Motion::LineStart),
+            "left" if word => Some(Motion::WordLeft),
+            "left" => Some(Motion::Left),
+            "right" if far => Some(Motion::LineEnd),
+            "right" if word => Some(Motion::WordRight),
+            "right" => Some(Motion::Right),
+            "up" if far => Some(Motion::Start),
+            "up" => Some(Motion::Lines(-1)),
+            "down" if far => Some(Motion::End),
+            "down" => Some(Motion::Lines(1)),
+            "home" if word && !mac => Some(Motion::Start),
+            "home" => Some(Motion::LineStart),
+            "end" if word && !mac => Some(Motion::End),
+            "end" => Some(Motion::LineEnd),
+            "pageup" => Some(Motion::Lines(-page)),
+            "pagedown" => Some(Motion::Lines(page)),
+            _ => None,
+        };
+        if let Some(motion) = motion {
+            buffer.go(motion, held.shift);
+            self.reveal_cursor = true;
+            cx.stop_propagation();
             cx.notify();
+            return;
+        }
+        let reach = if far {
+            Reach::Line
+        } else if word {
+            Reach::Word
+        } else {
+            Reach::Character
+        };
+        let edited = match key {
+            "backspace" => buffer.erase(reach, false),
+            "delete" => buffer.erase(reach, true),
+            "enter" if !far && !word => Some(buffer.newline()),
+            "tab" if !far && !word => buffer.indent(held.shift),
+            _ => return,
+        };
+        cx.stop_propagation();
+        if let Some(edited) = edited {
+            self.edited(edited, cx);
         }
     }
 
@@ -1100,13 +1830,31 @@ impl FileView {
         self._highlight = None;
         // What was selected may not be there any more.
         self.selection.clear();
+        let mut editable = true;
         self.content = match snapshot.loaded {
-            Loaded::Image => Content::Image,
-            Loaded::Message(message) => Content::Message(message),
-            Loaded::Text { lines, longest } => {
+            Loaded::Image => {
+                editable = false;
+                Content::Image
+            }
+            Loaded::Message(message) => {
+                editable = false;
+                Content::Message(message)
+            }
+            Loaded::Text {
+                lines,
+                longest,
+                raw,
+            } => {
                 let lines = Arc::new(lines);
                 if !snapshot.in_repository && self.opened.is_none() {
                     self.opened = Some(lines.clone());
+                }
+                match raw {
+                    Some(theirs) => {
+                        self.stamp = snapshot.mtime.map(|mtime| (mtime, theirs.len() as u64));
+                        self.absorb(theirs);
+                    }
+                    None => editable = false,
                 }
                 self.start_highlighting(lines.clone(), cx);
                 Content::Text(TextContent {
@@ -1114,10 +1862,21 @@ impl FileView {
                     lines,
                     longest,
                     changes: snapshot.changes,
+                    base: snapshot.base,
                     baseline_note: snapshot.baseline_note,
                 })
             }
         };
+        if !editable {
+            self.buffer = None;
+            self.unsaved = false;
+            self.cursor = false;
+        } else if self.unsaved {
+            // What was typed since the file was last written is not in
+            // the lines just read from it.
+            self.redraw_text(cx);
+            self.save_later(cx);
+        }
         if matches!(self.content, Content::Text(_)) {
             self.read_markdown(cx);
         }
@@ -1215,6 +1974,7 @@ impl FileView {
             return Vec::new();
         };
         let shown = self.shown_changes();
+        let composing = self.composing();
         range
             .map(|row_index| {
                 // Resolve the row to a kind, a line number and its text.
@@ -1264,7 +2024,29 @@ impl FileView {
                     _ => (0, &[][..]),
                 };
                 let line = content.clone();
-                let styled = if found.is_empty() {
+                let composed = composing
+                    .as_ref()
+                    .filter(|(line, _)| Some(*line) == line_index)
+                    .map(|(_, range)| range.clone())
+                    .filter(|range| {
+                        range.end <= content.len()
+                            && content.is_char_boundary(range.start)
+                            && content.is_char_boundary(range.end)
+                    });
+                let styled = if let Some(range) = composed {
+                    // What an input method is still composing is underlined.
+                    let underline = HighlightStyle {
+                        underline: Some(UnderlineStyle {
+                            thickness: px(1.),
+                            color: None,
+                            wavy: false,
+                        }),
+                        ..Default::default()
+                    };
+                    let combined: Vec<_> =
+                        combine_highlights(syntax, [(range, underline)]).collect();
+                    StyledText::new(content).with_highlights(combined)
+                } else if found.is_empty() {
                     match spans {
                         Some(_) => StyledText::new(content).with_highlights(syntax),
                         None => StyledText::new(content),
@@ -1446,6 +2228,116 @@ impl FileView {
     }
 }
 
+/// How many bytes into `text` a count of UTF-16 units is.
+fn bytes_in(text: &str, utf16: usize) -> usize {
+    let mut seen = 0;
+    for (at, c) in text.char_indices() {
+        if seen >= utf16 {
+            return at;
+        }
+        seen += c.len_utf16();
+    }
+    text.len()
+}
+
+/// Typing, as the window delivers it: plain keys, and what an input method
+/// composes.
+impl EntityInputHandler for FileView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let buffer = self.buffer.as_ref()?;
+        let range = buffer.from_utf16(range_utf16.start)..buffer.from_utf16(range_utf16.end);
+        actual_range.replace(buffer.to_utf16(range.start)..buffer.to_utf16(range.end));
+        Some(buffer.text()[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let buffer = self.buffer.as_ref().filter(|_| self.editing())?;
+        let selected = buffer.selection();
+        Some(UTF16Selection {
+            range: buffer.to_utf16(selected.start)..buffer.to_utf16(selected.end),
+            reversed: buffer.reversed(),
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        let buffer = self.buffer.as_ref()?;
+        let marked = buffer.marked()?;
+        Some(buffer.to_utf16(marked.start)..buffer.to_utf16(marked.end))
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        if let Some(buffer) = self.buffer.as_mut() {
+            buffer.unmark();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (true, Some(buffer)) = (self.editing(), self.buffer.as_mut()) else {
+            return;
+        };
+        let range =
+            range_utf16.map(|range| buffer.from_utf16(range.start)..buffer.from_utf16(range.end));
+        let edited = buffer.insert(range, &text.replace('\0', ""));
+        self.edited(edited, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        selected_utf16: Option<Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (true, Some(buffer)) = (self.editing(), self.buffer.as_mut()) else {
+            return;
+        };
+        let range =
+            range_utf16.map(|range| buffer.from_utf16(range.start)..buffer.from_utf16(range.end));
+        let text = text.replace('\0', "");
+        let selected =
+            selected_utf16.map(|range| bytes_in(&text, range.start)..bytes_in(&text, range.end));
+        let edited = buffer.compose(range, &text, selected);
+        self.edited(edited, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        _bounds: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        self.cursor_bounds()
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 impl Render for FileView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let text_system = window.text_system();
@@ -1464,9 +2356,16 @@ impl Render for FileView {
                 self.highlight_theme = theme::active_index();
             }
         }
+        if std::mem::take(&mut self.reveal_cursor) && self.editing() {
+            self.scroll_to_cursor();
+        }
         let previewing = self.previewing();
+        if previewing {
+            self.place_page(cx);
+        }
         // The text is about to say where it is drawn this time.
         self.selection.begin_frame();
+        self.show_selection(self.focus_handle.is_focused(window));
         let page = previewing.then(|| match &self.markdown {
             Some(_) => list(
                 self.page.clone(),
@@ -1533,9 +2432,9 @@ impl Render for FileView {
         } else {
             self.render_change_bar(cx)
         };
-        let preview_toggle = self.is_markdown.then(|| {
+        let chip = |id: &'static str, label: &'static str, on: bool| {
             div()
-                .id("toggle-preview")
+                .id(id)
                 .flex_none()
                 .h(px(18.))
                 .px(px(7.))
@@ -1544,16 +2443,36 @@ impl Render for FileView {
                 .rounded(px(4.))
                 .cursor_pointer()
                 .map(|chip| {
-                    if self.preview {
+                    if on {
                         chip.bg(theme::bg_active()).text_color(theme::text())
                     } else {
                         chip.text_color(theme::text_muted())
                             .hover(|style| style.bg(theme::bg_hover()))
                     }
                 })
-                .child("Preview")
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_preview(cx)))
+                .child(label)
+        };
+        // A Markdown file that can be edited is either being edited or
+        // being read as a page.
+        let edit_toggle = (self.is_markdown && self.buffer.is_some()).then(|| {
+            chip("toggle-edit", "Edit", !self.preview)
+                .on_click(cx.listener(|this, _, window, cx| this.show_source(window, cx)))
         });
+        let preview_toggle = self.is_markdown.then(|| {
+            chip("toggle-preview", "Preview", self.preview)
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_preview(window, cx)))
+        });
+        let save_note = self.save_note.clone().map(|note| {
+            div()
+                .flex_none()
+                .text_color(theme::red())
+                .child(note)
+        });
+        // Keys that type reach the text through the window's input, which
+        // is also how an input method composes into it.
+        let typing = self
+            .editing()
+            .then(|| (self.focus_handle.clone(), cx.entity()));
         let find_bar = self.find_open.then(|| {
             div()
                 .absolute()
@@ -1567,7 +2486,10 @@ impl Render for FileView {
         let view = cx.weak_entity();
         let drag = canvas(
             |_, _, _| (),
-            move |bounds, _, window, _| {
+            move |bounds, _, window, cx| {
+                if let Some((focus, entity)) = typing {
+                    window.handle_input(&focus, ElementInputHandler::new(bounds, entity), cx);
+                }
                 let dragged = view.clone();
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
                     if phase == DispatchPhase::Bubble {
@@ -1595,6 +2517,12 @@ impl Render for FileView {
             .key_context("FileView")
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
+            .on_action(cx.listener(Self::save_now))
+            .on_key_down(cx.listener(Self::on_key_down))
             .child(
                 div()
                     .h(px(26.))
@@ -1624,7 +2552,9 @@ impl Render for FileView {
                             ),
                     )
                     .child(div().flex_1())
+                    .children(save_note)
                     .children(change_bar)
+                    .children(edit_toggle)
                     .children(preview_toggle),
             )
             .child(
@@ -1659,6 +2589,65 @@ mod tests {
         assert_eq!(prepare_line("\ta\tb"), "    a   b");
         let long = "x".repeat(MAX_LINE_CHARS + 50);
         assert_eq!(prepare_line(&long).chars().count(), MAX_LINE_CHARS + 1);
+    }
+
+    #[test]
+    fn markdown_that_can_be_edited_loads_with_its_own_text() {
+        let dir = temp_dir("editable");
+        let raw_of = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            fs::write(&path, bytes).unwrap();
+            match load(&path).0 {
+                Loaded::Text { lines, raw, .. } => (lines, raw),
+                _ => panic!("expected text"),
+            }
+        };
+        let (lines, raw) = raw_of("notes.md", b"# Notes\r\n\tindented\n");
+        assert_eq!(raw.as_deref(), Some("# Notes\r\n\tindented\n"));
+        assert_eq!(lines, vec![SharedString::from("# Notes"), "    indented".into()]);
+        // Other files, text that is not UTF-8, and lines too long to draw whole.
+        assert_eq!(raw_of("notes.txt", b"# Notes\n").1, None);
+        assert_eq!(raw_of("latin.md", b"caf\xe9\n").1, None);
+        let long = "x".repeat(MAX_EDIT_LINE + 1);
+        assert_eq!(raw_of("long.md", long.as_bytes()).1, None);
+        // A line being edited is drawn whole, and the editor agrees with
+        // the view about where each character of it is.
+        let (lines, raw) = raw_of("wide.md", "x".repeat(MAX_LINE_CHARS + 50).as_bytes());
+        assert!(raw.is_some());
+        assert_eq!(lines[0].len(), MAX_LINE_CHARS + 50);
+        for line in ["", "plain", "\ta\tb", "a\u{1}b\u{85}c", "é\t😀\t\t!"] {
+            let shown = shown_line(line, usize::MAX);
+            assert_eq!(editor::to_shown(line, line.len()), shown.len(), "{line:?}");
+            for (offset, _) in line.char_indices() {
+                let at = editor::to_shown(line, offset);
+                assert!(shown.is_char_boundary(at), "{line:?} at {offset}");
+                assert_eq!(editor::from_shown(line, at), offset, "{line:?} at {offset}");
+            }
+        }
+
+        let path = dir.join("locked.md");
+        fs::write(&path, "# Locked\n").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions.clone()).unwrap();
+        assert!(matches!(load(&path).0, Loaded::Text { raw: None, .. }));
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn colors_fit_a_line_that_changed_under_them() {
+        let red = Hsla::default();
+        let spans = [(0..2, red), (2..6, red), (8..12, red)];
+        assert_eq!(&*fit_spans(&spans, "abcd"), &[(0..2, red), (2..4, red)]);
+        // Never through the middle of a character.
+        let spans = [(0..1, red), (1..4, red), (3..9, red)];
+        assert_eq!(&*fit_spans(&spans, "aéé"), &[(0..1, red), (3..5, red)]);
+        let lines: Vec<SharedString> = vec!["ab".into(), "abcd".into(), "abcd".into()];
+        assert_eq!(longest_of(&lines), 1);
+        assert_eq!(longest_of(&[]), 0);
     }
 
     #[test]
@@ -1698,9 +2687,15 @@ mod tests {
         let text_path = dir.join("a.txt");
         fs::write(&text_path, "one\r\ntwo longer\n").unwrap();
         match load(&text_path).0 {
-            Loaded::Text { lines, longest } => {
+            Loaded::Text {
+                lines,
+                longest,
+                raw,
+            } => {
                 assert_eq!(lines, vec![SharedString::from("one"), "two longer".into()]);
                 assert_eq!(longest, 1);
+                // Only Markdown is edited here.
+                assert_eq!(raw, None);
             }
             _ => panic!("expected text"),
         }
